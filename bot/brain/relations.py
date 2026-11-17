@@ -22,6 +22,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from bot.brain.drive import get_drive
 from bot.brain.llm import LLMRouter
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
 Тебе дают текущие досье, сегодняшнюю дату и свежие реплики. Для каждого человека из свежих реплик верни:
 - delta — изменение симпатии бота к нему: от -2 (всерьёз обидел, унизил бота) до +2 (поддержал, рассмешил,
   дал боту классный материал). Не взаимодействовал с ботом — 0. Дружеские подколы и мат — не минус.
+- provoked — сколько раз в этих репликах БОТ провоцировал, подкалывал или троллил этого человека (0, 1, 2…).
 - facts — главное о человеке: чем живёт, работа/учёба, во что играет, увлечения. До {facts} пунктов.
 - plans — планы, намерения и обещания С ДАТОЙ, когда сказал: «купить микрофон (17.11)». До {plans} пунктов.
   Выполненный или брошенный план убери из plans; если он сорвался или человек слился — перенеси в hooks
@@ -50,7 +52,7 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
 Если в разделе ничего не изменилось — верни null (раздел останется прежним). Если изменилось — верни
 раздел ЦЕЛИКОМ, уже сжатый: объедини похожие пункты, выкинь самое неважное, если не влезает в лимит.
 
-Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число,
+Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "provoked": число,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}]}}"""
 
 
@@ -246,6 +248,10 @@ class RelationsJudge:
                 except (TypeError, ValueError):
                     delta = 0.0
                 rel.score = max(-10.0, min(10.0, rel.score + delta))
+                try:  # сколько раз бот его провоцировал — утоляет голод и «насыщает» им
+                    get_drive().on_provoked(name, max(0, min(5, int(ch.get("provoked") or 0))))
+                except (TypeError, ValueError):
+                    pass
                 changed = []
                 for key, limit in LIMITS.items():
                     items = _clean_list(ch.get(key), limit)

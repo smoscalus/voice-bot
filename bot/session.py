@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import random
 import logging
 import time
@@ -26,6 +27,7 @@ from bot.audio.player import VoicePlayer
 from bot.audio.receiver import SegmentingSink
 from bot.audio.segmenter import Utterance, UtteranceSegmenter
 from bot.brain.interest import InterestClassifier
+from bot.brain.drive import get_drive
 from bot.brain.llm import LLMRouter
 from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
@@ -83,6 +85,8 @@ class VoiceSession:
         self._last_backchannel = 0.0
         self._seen_users: set[int] = set()   # кто уже говорил в этой сессии
         self._returning: set[str] = set()    # вернулись, и на них есть материал в памяти
+        self.drive = get_drive()              # голод на провокации и «сытость» каждым человеком
+        self._my_lines: deque[str] = deque(maxlen=12)  # свои последние реплики — чтобы не повторяться
         self._tasks: set[asyncio.Task] = set()
 
     def set_brain(self, settings: Settings, client: AsyncOpenAI, stt: STTEngine) -> None:
@@ -137,8 +141,20 @@ class VoiceSession:
     def _relations_context(self) -> str:
         """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
-        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants)]
+        people = {}
+        for name, uid in participants.items():
+            r = self.relations.get(uid, name)
+            people[name] = (len(r.facts) + len(r.plans) + len(r.hooks), r.score)
+        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants),
+                  self.drive.prompt_block(people) if people else "", self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
+
+    def _my_lines_block(self) -> str:
+        """Против повторов: модель видит свои недавние реплики, даже ушедшие из окна расшифровки."""
+        if not self._my_lines:
+            return ""
+        return ("Твои последние реплики — НЕ повторяй эти вопросы, шутки, наезды и формулировки, "
+                "придумай новое:\n" + "\n".join(f"- {t}" for t in self._my_lines))
 
     def _spawn(self, coro) -> asyncio.Task:
         t = asyncio.create_task(coro)
@@ -352,6 +368,10 @@ class VoiceSession:
             log.debug("skip evaluation: %s", why or "proactive disabled")
             self.policy.reset_interest()
             return
+        if not follow_up and not self._returning and not self.drive.wants_to_provoke():
+            # сыт провокациями — сам не лезет и не тратит лимит на «а не влезть ли»
+            self.policy.reset_interest()
+            return
         if not self.policy.can_classify():
             log.warning("classifier hourly budget exhausted")
             return
@@ -491,6 +511,8 @@ class VoiceSession:
                     keep = keep.rsplit(" ", 1)[0] if " " in keep else ""
                     text = f"{keep}… [меня перебили]" if keep else "[меня перебили сразу, ничего не сказал]"
                 line.text = text or "…"
+                if text and not cut:
+                    self._my_lines.append(text)
                 if not text:
                     self.buffer.remove(line)  # ничего не сказала — пустую реплику в память не пишем
                 log.info("BOT (%s%s): %s", "proactive" if proactive else "direct",
