@@ -1,0 +1,84 @@
+﻿# Запуск бота одной кнопкой через Docker (Windows). Запускается из start.bat.
+$ErrorActionPreference = "Stop"
+Set-Location -Path $PSScriptRoot
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Say($text, $color = "Gray") { Write-Host $text -ForegroundColor $color }
+function Fail($text) { Say $text "Red"; Read-Host "Нажми Enter, чтобы закрыть"; exit 1 }
+
+function Get-EnvValue($key) {
+    $line = Get-Content .env -Encoding UTF8 | Where-Object { $_ -match "^$key=" } | Select-Object -First 1
+    if ($line) { return ($line -split "=", 2)[1].Trim() } else { return "" }
+}
+function Set-EnvValue($key, $value) {
+    $lines = @(Get-Content .env -Encoding UTF8)
+    $found = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "^#?\s*$key=") { $lines[$i] = "$key=$value"; $found = $true; break }
+    }
+    if (-not $found) { $lines += "$key=$value" }
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot ".env"), ($lines -join "`n") + "`n", $Utf8NoBom)
+}
+
+Say "=== Голосовой бот: запуск ===" "Cyan"
+
+# 1. Docker
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    Fail "Не найден Docker. Поставь Docker Desktop: https://www.docker.com/products/docker-desktop/ и запусти снова.`n(Или без Docker: setup.bat, потом run.bat)"
+}
+docker info *> $null
+if ($LASTEXITCODE -ne 0) { Fail "Docker установлен, но не запущен. Открой Docker Desktop, дождись зелёного статуса и запусти снова." }
+
+# 2. Первый запуск — создаём .env и спрашиваем главное
+if (-not (Test-Path .env)) {
+    Copy-Item .env.example .env
+    Say "`nПервый запуск — пара вопросов." "Yellow"
+    $token = Read-Host "Токен Discord-бота (discord.com/developers/applications → Bot → Reset Token)"
+    if (-not $token) { Remove-Item .env; Fail "Без токена бот не запустится." }
+    Set-EnvValue "DISCORD_TOKEN" $token.Trim()
+    Say "`nГде будут работать мозги бота?"
+    Say "  1 — на этом компьютере (Ollama): бесплатно, без лимитов, но глупее и медленнее"
+    Say "  2 — в облаке Groq: умнее и быстрее, бесплатно, но с дневными лимитами (нужен ключ)"
+    $choice = Read-Host "Выбери 1 или 2"
+    if ($choice -eq "2") {
+        $key = Read-Host "Ключ Groq (console.groq.com → API Keys, начинается с gsk_)"
+        Set-EnvValue "PROVIDER" "groq"
+        Set-EnvValue "GROQ_API_KEY" $key.Trim()
+    } else {
+        Set-EnvValue "PROVIDER" "local"
+    }
+}
+
+$provider = Get-EnvValue "PROVIDER"
+if (-not $provider) { $provider = "local" }
+$composeArgs = @("compose")
+
+# 3. Локальный режим: своя Ollama на компе или контейнер (с видеокартой, если есть)
+if ($provider -eq "local") {
+    $hostOllama = $false
+    try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 http://localhost:11434/api/tags | Out-Null; $hostOllama = $true } catch {}
+    if ($hostOllama) {
+        Say "Нашёл Ollama на этом компьютере — использую её." "Green"
+        Set-EnvValue "DOCKER_OLLAMA_URL" "http://host.docker.internal:11434"
+    } else {
+        Set-EnvValue "DOCKER_OLLAMA_URL" "http://ollama:11434"
+        $composeArgs += @("-f", "docker-compose.yml")
+        if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+            Say "Видеокарта NVIDIA найдена — Ollama будет считать на ней." "Green"
+            $composeArgs += @("-f", "docker-compose.gpu.yml")
+        } else {
+            Say "Видеокарты NVIDIA нет — Ollama будет на процессоре (медленнее). Совет: OLLAMA_MODEL=qwen2.5:3b в .env" "Yellow"
+        }
+        $composeArgs += @("--profile", "local")
+    }
+}
+
+# 4. Поехали
+Say "`nСобираю и запускаю (первый раз — несколько минут: скачиваются зависимости и модели)…" "Cyan"
+& docker @composeArgs up -d --build
+if ($LASTEXITCODE -ne 0) { Fail "Не удалось запустить. Посмотри сообщение выше." }
+
+Say "`nБот запущен в фоне. Зайди в голосовой канал и напиши /join" "Green"
+Say "Остановить: stop.bat   Переключить мозги на ходу: /brain в Discord`n"
+Say "Логи (закрыть окно — бот продолжит работать):" "Gray"
+& docker compose logs -f --tail 50 bot

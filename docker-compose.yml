@@ -1,0 +1,34 @@
+# Запуск одной командой — проще всего через start.bat (Windows) или ./start.sh (Linux/macOS).
+#
+#   Облако (Groq):                   docker compose up -d --build
+#   Локально, Ollama в контейнере:   docker compose --profile local up -d --build
+#   ... с видеокартой NVIDIA:        docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile local up -d --build
+#
+# Если Ollama уже стоит на самом компьютере — контейнер не нужен: start-скрипт сам укажет боту
+# DOCKER_OLLAMA_URL=http://host.docker.internal:11434
+
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      # внутри docker «localhost» — это сам контейнер, поэтому адрес Ollama свой
+      OLLAMA_URL: ${DOCKER_OLLAMA_URL:-http://ollama:11434}
+      LOCAL_WHISPER_DEVICE: ${DOCKER_WHISPER_DEVICE:-cpu}
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local"]
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama:

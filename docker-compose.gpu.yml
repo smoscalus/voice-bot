@@ -1,0 +1,11 @@
+# Дополнение для видеокарт NVIDIA: Ollama в контейнере считает на GPU (в разы быстрее).
+# Нужны драйвер NVIDIA и поддержка GPU в Docker (Docker Desktop + WSL2 на Windows, nvidia-container-toolkit на Linux).
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
