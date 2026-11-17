@@ -1,4 +1,5 @@
-﻿# Запуск бота одной кнопкой через Docker (Windows). Запускается из start.bat.
+﻿# Запуск бота одной кнопкой через Docker (Windows). Запускается из start.bat (или config.bat — перенастроить).
+param([switch]$Configure)
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -29,24 +30,94 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 docker info *> $null
 if ($LASTEXITCODE -ne 0) { Fail "Docker установлен, но не запущен. Открой Docker Desktop, дождись зелёного статуса и запусти снова." }
 
-# 2. Первый запуск — создаём .env и спрашиваем главное
-if (-not (Test-Path .env)) {
-    Copy-Item .env.example .env
-    Say "`nПервый запуск — пара вопросов." "Yellow"
-    $token = Read-Host "Токен Discord-бота (discord.com/developers/applications → Bot → Reset Token)"
-    if (-not $token) { Remove-Item .env; Fail "Без токена бот не запустится." }
-    Set-EnvValue "DISCORD_TOKEN" $token.Trim()
+# 2. Настройка: при первом запуске — обязательно, потом — через config.bat
+function Get-VramGB {
+    # Сколько видеопамяти у самой большой видеокарты (NVIDIA и AMD). Точное значение — в реестре драйвера.
+    $best = 0
+    try {
+        $root = "HKLM:\SYSTEM\ControlSet001\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $v = (Get-ItemProperty $_.PSPath -Name "HardwareInformation.qwMemorySize" -ErrorAction SilentlyContinue)."HardwareInformation.qwMemorySize"
+            if ($v) { $best = [Math]::Max($best, [double]$v) }
+        }
+    } catch {}
+    if ($best -eq 0) {  # запасной способ (он не видит больше 4 ГБ, но лучше, чем ничего)
+        try { Get-CimInstance Win32_VideoController | ForEach-Object { $best = [Math]::Max($best, [double]$_.AdapterRAM) } } catch {}
+    }
+    return [Math]::Round($best / 1GB)
+}
+
+function Ask($question, $current) {
+    $hint = if ($current) { " [Enter — оставить]" } else { "" }
+    $answer = (Read-Host "$question$hint").Trim()
+    if (-not $answer) { return $current } else { return $answer }
+}
+
+function Run-Setup([bool]$first) {
+    # при первом запуске значения из шаблона — не «выбор человека», поэтому их не предлагаем оставить
+    Say "`n--- Настройка ---" "Yellow"
+
+    # токен
+    $token = Ask "Токен Discord-бота (discord.com/developers/applications → Bot → Reset Token)" (Get-EnvValue "DISCORD_TOKEN")
+    if (-not $token) { Fail "Без токена бот не запустится." }
+    Set-EnvValue "DISCORD_TOKEN" $token
+
+    # где мозги
+    $cur = if ($first) { "" } else { Get-EnvValue "PROVIDER" }
     Say "`nГде будут работать мозги бота?"
     Say "  1 — на этом компьютере (Ollama): бесплатно, без лимитов, но глупее и медленнее"
     Say "  2 — в облаке Groq: умнее и быстрее, бесплатно, но с дневными лимитами (нужен ключ)"
-    $choice = Read-Host "Выбери 1 или 2"
-    if ($choice -eq "2") {
-        $key = Read-Host "Ключ Groq (console.groq.com → API Keys, начинается с gsk_)"
-        Set-EnvValue "PROVIDER" "groq"
-        Set-EnvValue "GROQ_API_KEY" $key.Trim()
+    $default = if ($cur -eq "groq") { "2" } elseif ($cur -eq "local") { "1" } else { "" }
+    $choice = Ask "Выбери 1 или 2" $default
+    $provider = if ($choice -eq "2") { "groq" } else { "local" }
+    Set-EnvValue "PROVIDER" $provider
+
+    # ключ Groq
+    $curKey = Get-EnvValue "GROQ_API_KEY"
+    Say ""
+    if ($provider -eq "groq") {
+        Say "Ключ Groq: console.groq.com → API Keys (бесплатно, начинается с gsk_)"
+        $key = Ask "Ключ Groq" $curKey
+        if (-not $key) { Fail "Для облачных мозгов нужен ключ Groq." }
     } else {
-        Set-EnvValue "PROVIDER" "local"
+        Say "Ключ Groq — НЕОБЯЗАТЕЛЬНО. С ним распознавание речи пойдёт через облако: быстро и точно,"
+        Say "а мозги останутся на компе без лимитов. Без него всё будет на компе (медленнее)."
+        $key = Ask "Ключ Groq (Enter — пропустить)" $curKey
     }
+    Set-EnvValue "GROQ_API_KEY" $key
+
+    # модель (только для мозгов на компе)
+    if ($provider -eq "local") {
+        $vram = Get-VramGB
+        $rec = if ($vram -ge 12) { "3" } elseif ($vram -ge 6) { "2" } else { "1" }
+        $models = @{ "1" = "qwen2.5:3b"; "2" = "qwen2.5:7b"; "3" = "qwen2.5:14b" }
+        Say "`nКакую модель взять? (видеопамять: $(if ($vram) { "$vram ГБ" } else { 'не определил' }))"
+        Say "  1 — qwen2.5:3b   слабый компьютер или без видеокарты (быстро, но туповато)"
+        Say "  2 — qwen2.5:7b   видеокарта 6–8 ГБ"
+        Say "  3 — qwen2.5:14b  видеокарта 12 ГБ и больше (заметно умнее)"
+        Say "  4 — своя (ввести название модели из ollama.com/library)"
+        $curModel = if ($first) { "" } else { Get-EnvValue "OLLAMA_MODEL" }
+        $curNum = ($models.GetEnumerator() | Where-Object { $_.Value -eq $curModel } | Select-Object -First 1).Key
+        $pick = Ask "Выбери 1–4 (советую $rec)" $(if ($curNum) { $curNum } else { $rec })
+        if ($pick -eq "4") {
+            $model = Ask "Название модели (например, gemma3:12b)" $curModel
+        } elseif ($models.ContainsKey($pick)) {
+            $model = $models[$pick]
+        } else {
+            $model = $models[$rec]
+        }
+        Set-EnvValue "OLLAMA_MODEL" $model
+        Say "Модель: $model — скачается сама при первом запуске." "Green"
+    }
+    Say "`nГотово. Поменять это потом можно через config.bat." "Green"
+}
+
+if (-not (Test-Path .env)) {
+    Copy-Item .env.example .env
+    Say "`nПервый запуск — пара вопросов." "Yellow"
+    Run-Setup $true
+} elseif ($Configure) {
+    Run-Setup $false
 }
 
 $provider = Get-EnvValue "PROVIDER"

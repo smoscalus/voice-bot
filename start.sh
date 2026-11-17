@@ -24,22 +24,81 @@ say "=== Голосовой бот: запуск ==="
 command -v docker >/dev/null || fail "Не найден Docker: https://docs.docker.com/get-docker/"
 docker info >/dev/null 2>&1 || fail "Docker не запущен (или нужен sudo / группа docker)."
 
+vram_gb() {  # видеопамять самой большой видеокарты, ГБ (NVIDIA или AMD); 0 — не определил
+  local best=0 v
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    v=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)
+    [ -n "$v" ] && best=$(( v / 1024 ))
+  fi
+  for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+    [ -r "$f" ] || continue
+    v=$(( $(cat "$f") / 1073741824 )); [ "$v" -gt "$best" ] && best=$v
+  done
+  echo "$best"
+}
+
+ask() {  # ask "вопрос" "текущее значение" → ответ (Enter — оставить текущее)
+  local hint="" answer
+  [ -n "$2" ] && hint=" [Enter — оставить]"
+  read -rp "$1$hint: " answer
+  echo "${answer:-$2}"
+}
+
+run_setup() {  # $1 = 1 при первом запуске (значения из шаблона не предлагаем «оставить»)
+  local first="$1" cur token choice provider key vram rec pick model cur_model
+  say ""; say "--- Настройка ---"
+  token=$(ask "Токен Discord-бота (discord.com/developers/applications → Bot → Reset Token)" "$(get_env DISCORD_TOKEN)")
+  [ -n "$token" ] || fail "Без токена бот не запустится."
+  set_env DISCORD_TOKEN "$token"
+
+  cur=""; [ "$first" = 1 ] || cur=$(get_env PROVIDER)
+  say ""; say "Где будут работать мозги бота?"
+  say "  1 — на этом компьютере (Ollama): бесплатно, без лимитов, но глупее и медленнее"
+  say "  2 — в облаке Groq: умнее и быстрее, бесплатно, но с дневными лимитами (нужен ключ)"
+  choice=$(ask "Выбери 1 или 2" "$([ "$cur" = groq ] && echo 2 || { [ "$cur" = local ] && echo 1; } || true)")
+  provider=local; [ "$choice" = 2 ] && provider=groq
+  set_env PROVIDER "$provider"
+
+  say ""
+  if [ "$provider" = groq ]; then
+    say "Ключ Groq: console.groq.com → API Keys (бесплатно, начинается с gsk_)"
+    key=$(ask "Ключ Groq" "$(get_env GROQ_API_KEY)")
+    [ -n "$key" ] || fail "Для облачных мозгов нужен ключ Groq."
+  else
+    say "Ключ Groq — НЕОБЯЗАТЕЛЬНО. С ним распознавание речи пойдёт через облако (быстро и точно),"
+    say "а мозги останутся на компе без лимитов. Без него всё будет на компе (медленнее)."
+    key=$(ask "Ключ Groq (Enter — пропустить)" "$(get_env GROQ_API_KEY)")
+  fi
+  set_env GROQ_API_KEY "$key"
+
+  if [ "$provider" = local ]; then
+    vram=$(vram_gb)
+    if [ "$vram" -ge 12 ]; then rec=3; elif [ "$vram" -ge 6 ]; then rec=2; else rec=1; fi
+    say ""; say "Какую модель взять? (видеопамять: $([ "$vram" -gt 0 ] && echo "$vram ГБ" || echo 'не определил'))"
+    say "  1 — qwen2.5:3b   слабый компьютер или без видеокарты"
+    say "  2 — qwen2.5:7b   видеокарта 6–8 ГБ"
+    say "  3 — qwen2.5:14b  видеокарта 12 ГБ и больше (заметно умнее)"
+    say "  4 — своя (название из ollama.com/library)"
+    cur_model=""; [ "$first" = 1 ] || cur_model=$(get_env OLLAMA_MODEL)
+    case "$cur_model" in qwen2.5:3b) cur=1;; qwen2.5:7b) cur=2;; qwen2.5:14b) cur=3;; "") cur=$rec;; *) cur=4;; esac
+    pick=$(ask "Выбери 1–4 (советую $rec)" "$cur")
+    case "$pick" in
+      1) model=qwen2.5:3b;; 2) model=qwen2.5:7b;; 3) model=qwen2.5:14b;;
+      4) model=$(ask "Название модели (например, gemma3:12b)" "$cur_model");;
+      *) model=$([ "$rec" = 3 ] && echo qwen2.5:14b || { [ "$rec" = 2 ] && echo qwen2.5:7b; } || echo qwen2.5:3b);;
+    esac
+    set_env OLLAMA_MODEL "$model"
+    say "Модель: $model — скачается сама при первом запуске."
+  fi
+  say ""; say "Готово. Поменять потом: ./start.sh config"
+}
+
 if [ ! -f .env ]; then
   cp .env.example .env
   say "Первый запуск — пара вопросов."
-  read -rp "Токен Discord-бота: " token
-  [ -n "$token" ] || { rm .env; fail "Без токена бот не запустится."; }
-  set_env DISCORD_TOKEN "$token"
-  say "Где будут работать мозги бота?"
-  say "  1 — на этом компьютере (Ollama): бесплатно, без лимитов, но глупее и медленнее"
-  say "  2 — в облаке Groq: умнее и быстрее, бесплатно, но с дневными лимитами (нужен ключ)"
-  read -rp "Выбери 1 или 2: " choice
-  if [ "$choice" = "2" ]; then
-    read -rp "Ключ Groq (console.groq.com → API Keys): " key
-    set_env PROVIDER groq; set_env GROQ_API_KEY "$key"
-  else
-    set_env PROVIDER local
-  fi
+  run_setup 1
+elif [ "${1:-}" = "config" ]; then
+  run_setup 0
 fi
 
 provider="$(get_env PROVIDER)"; provider="${provider:-local}"
