@@ -71,15 +71,24 @@ class VoicePlayer:
     def is_playing(self) -> bool:
         return self.vc.is_playing()
 
+    def _stop_playing(self) -> None:
+        # ВАЖНО: у VoiceRecvClient метод stop() останавливает и воспроизведение, И ПРИЁМ звука —
+        # бот «глохнет» без всяких ошибок. Поэтому глушим только воспроизведение.
+        stop_playing = getattr(self.vc, "stop_playing", None)
+        if stop_playing is not None:
+            stop_playing()
+        else:
+            self.vc.stop()
+
     def stop(self) -> None:
         if self.vc.is_playing():
-            self.vc.stop()
+            self._stop_playing()
 
     def interrupt(self) -> None:
         """Перебили: замолкаем сразу (как голосовой режим ChatGPT)."""
         if self.vc.is_playing():
             self.interrupted = True
-            self.vc.stop()
+            self._stop_playing()
 
     async def play_stream(self, chunks: AsyncIterator[bytes]) -> None:
         """Проиграть поток PCM 24к моно; вернуться, когда звук закончится или его остановят."""

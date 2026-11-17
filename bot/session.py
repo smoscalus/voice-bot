@@ -143,8 +143,14 @@ class VoiceSession:
     def _spawn(self, coro) -> asyncio.Task:
         t = asyncio.create_task(coro)
         self._tasks.add(t)
-        t.add_done_callback(self._tasks.discard)
+        t.add_done_callback(self._task_done)
         return t
+
+    def _task_done(self, t: asyncio.Task) -> None:
+        self._tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            # раньше упавшая фоновая задача умирала молча — теперь видно в логе
+            log.error("фоновая задача упала: %r", t.exception(), exc_info=t.exception())
 
     # ------------------------------------------------------------------ audio → text
     def _on_utterance_threadsafe(self, utt: Utterance) -> None:
@@ -154,7 +160,19 @@ class VoiceSession:
     async def _ticker(self) -> None:
         while True:
             await asyncio.sleep(0.1)
+            try:
+                self._tick()
+            except Exception:
+                log.exception("ошибка в ticker")  # тикер не должен умирать: на нём держится весь приём
+
+    def _tick(self) -> None:
+        if True:
             self.segmenter.flush_stale()
+            # страховка: приём звука выключился (кто-то вызвал vc.stop() и т.п.) — включаем обратно
+            if not self._reconnecting and self.vc.is_connected() and not self.vc.is_listening():
+                log.warning("приём звука был выключен — включаю обратно")
+                self.sink = SegmentingSink(self.segmenter)
+                self.vc.listen(self.sink)
             # самовосстановление: после смены ключей шифрования бот может «оглохнуть»
             if (not self._reconnecting and time.monotonic() - self._last_reconnect > 30
                     and (get_health(self.vc).is_deaf() or self._receiver_dead())):
@@ -470,7 +488,7 @@ class VoiceSession:
                     # в памяти оставляем только то, что успело прозвучать
                     keep = text[: int(len(text) * self.player.played_ratio)]
                     keep = keep.rsplit(" ", 1)[0] if " " in keep else ""
-                    text = f"{keep}… [меня перебили]" if keep else "[меня перебили, не успела ничего сказать]"
+                    text = f"{keep}… [меня перебили]" if keep else "[меня перебили сразу, ничего не сказал]"
                 line.text = text or "…"
                 if not text:
                     self.buffer.remove(line)  # ничего не сказала — пустую реплику в память не пишем
