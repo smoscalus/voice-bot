@@ -54,9 +54,25 @@ if (-not $provider) { $provider = "local" }
 $composeArgs = @("compose")
 
 # 3. Локальный режим: своя Ollama на компе или контейнер (с видеокартой, если есть)
+function Test-HostOllama {
+    # Стучимся напрямую в порт: «localhost» Windows часто пробует сначала по IPv6, а Ollama слушает только IPv4
+    foreach ($h in @("127.0.0.1", "localhost")) {
+        $c = New-Object System.Net.Sockets.TcpClient
+        try {
+            $ar = $c.BeginConnect($h, 11434, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(2000) -and $c.Connected) { return "порт 11434 на $h отвечает" }
+        } catch {} finally { $c.Close() }
+    }
+    # порт пока молчит (Ollama ещё запускается), но процесс есть — всё равно используем её, бот подождёт
+    $p = Get-Process -Name "ollama*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($p) { return "запущен процесс $($p.ProcessName)" }
+    return $null
+}
+
 if ($provider -eq "local") {
-    $hostOllama = $false
-    try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 http://localhost:11434/api/tags | Out-Null; $hostOllama = $true } catch {}
+    $found = Test-HostOllama
+    $hostOllama = [bool]$found
+    if ($found) { Say "Ollama на компьютере: $found" "Gray" } else { Say "Ollama на этом компьютере не запущена." "Gray" }
     if ($hostOllama) {
         Say "Нашёл Ollama на этом компьютере — использую её." "Green"
         Set-EnvValue "DOCKER_OLLAMA_URL" "http://host.docker.internal:11434"
