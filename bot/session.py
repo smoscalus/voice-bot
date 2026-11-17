@@ -40,6 +40,11 @@ from bot.stt.base import STTEngine, clean_transcript
 
 log = logging.getLogger(__name__)
 
+UNCLEAR_CONFIDENCE = -0.8   # avg_logprob Whisper ниже этого — фраза распознана как каша
+NOISE_MIN_LINES = 5         # сколько фраз за минуту смотреть, чтобы решить «вокруг шум»
+NOISE_UNCLEAR_SHARE = 0.6   # доля неразборчивых среди них
+NOISE_COMPLAINT_EVERY_S = 300
+
 
 class VoiceSession:
     def __init__(self, vc: voice_recv.VoiceRecvClient, settings: Settings, client: AsyncOpenAI, stt: STTEngine, tts,
@@ -87,6 +92,8 @@ class VoiceSession:
         self._returning: set[str] = set()    # вернулись, и на них есть материал в памяти
         self.drive = get_drive()              # голод на провокации и «сытость» каждым человеком
         self._my_lines: deque[str] = deque(maxlen=12)  # свои последние реплики — чтобы не повторяться
+        self._clarity: deque[tuple[float, bool]] = deque(maxlen=12)  # (когда, неразборчиво ли) — детектор шума
+        self._last_noise_complaint = 0.0
         self._tasks: set[asyncio.Task] = set()
 
     def set_brain(self, settings: Settings, client: AsyncOpenAI, stt: STTEngine) -> None:
@@ -253,18 +260,27 @@ class VoiceSession:
         try:
             async with self._stt_sem:
                 try:
-                    raw = await self.stt.transcribe(mono48_to_mono16(utt.pcm_mono48), prompt=persona.STT_PROMPT)
+                    samples = mono48_to_mono16(utt.pcm_mono48)
+                    if hasattr(self.stt, "transcribe_scored"):
+                        raw, confidence = await self.stt.transcribe_scored(samples, prompt=persona.STT_PROMPT)
+                    else:
+                        raw, confidence = await self.stt.transcribe(samples, prompt=persona.STT_PROMPT), None
                 except Exception:
                     log.exception("STT failed")
                     return
-            text = clean_transcript(raw)
+            text = clean_transcript(raw, persona.STT_PROMPT)
             if not text:
                 return
-            self.buffer.add(utt.user_name, text, ts=utt.started_at, speaker_id=utt.user_id,
-                            end_ts=utt.started_at + utt.duration_s)
+            # Whisper не уверен — значит, скорее всего, каша: помечаем, чтобы бот мог переспросить
+            unclear = confidence is not None and confidence < UNCLEAR_CONFIDENCE
+            self._note_clarity(unclear)
+            self.buffer.add(utt.user_name, f"(неразборчиво) {text}" if unclear else text, ts=utt.started_at,
+                            speaker_id=utt.user_id, end_ts=utt.started_at + utt.duration_s)
         finally:
             self._stt_inflight -= 1
-        log.info("[%s %.1fs, stt %.2fs] %s", utt.user_name, utt.duration_s, time.perf_counter() - t0, text)
+        log.info("[%s %.1fs, stt %.2fs%s] %s", utt.user_name, utt.duration_s, time.perf_counter() - t0,
+                 f", уверенность {confidence:.2f}{' — НЕРАЗБОРЧИВО' if unclear else ''}" if confidence is not None else "",
+                 text)
         self._spawn(self.judge.maybe_update(self.buffer))  # досье/отношения в фоне (не чаще раза в 90 с)
         utt_end = utt.started_at + utt.duration_s
 
@@ -304,6 +320,20 @@ class VoiceSession:
         await asyncio.sleep(min(2.5, self.s.attention_window_s))
         if self.policy.take_attention(user_id):  # продолжения не было
             self._request_reply(utt_end)
+
+    def _note_clarity(self, unclear: bool) -> None:
+        """Если за последнюю минуту большинство фраз — каша, бот говорит, что ничего не понимает (не чаще раза в 5 мин)."""
+        now = time.monotonic()
+        self._clarity.append((now, unclear))
+        recent = [u for t, u in self._clarity if now - t < 60]
+        if (len(recent) >= NOISE_MIN_LINES and sum(recent) / len(recent) >= NOISE_UNCLEAR_SHARE
+                and now - self._last_noise_complaint > NOISE_COMPLAINT_EVERY_S and not self._reply_busy()):
+            self._last_noise_complaint = now
+            self._clarity.clear()
+            log.info("вокруг сплошная каша (%d из %d фраз неразборчивы) — жалуюсь на шум", sum(recent), len(recent))
+            self._spawn(self._speak_stream(
+                self.responder.stream_task(self.buffer.render(self.buffer.recent(8)), persona.NOISE_TASK),
+                proactive=False))
 
     # ------------------------------------------------------------------ batched reply
     def _request_reply(self, utt_end: float) -> None:

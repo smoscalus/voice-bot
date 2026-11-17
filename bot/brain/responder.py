@@ -18,7 +18,12 @@ _EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️‍]+")
 _STARS = re.compile(r"\*([^*\n]{1,60})\*")
 
 
+# служебная пометка распознавания — модель иногда копирует её себе в ответ, вслух её читать нельзя
+_UNCLEAR_MARK = re.compile(r"\((?:не|недо)?\s*разборчив\w*\)|\(переспрашивает\)", re.IGNORECASE)
+
+
 def _clean(text: str) -> str:
+    text = _UNCLEAR_MARK.sub("", text)
     text = _STARS.sub(r"(\1)", _EMOJI.sub("", _CJK.sub("", text)))
     return re.sub(r"\s{2,}", " ", text).strip()
 
@@ -62,6 +67,10 @@ class Responder:
     def stream_batch(self, transcript: str, new_lines: str) -> AsyncIterator[str]:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         return self._generate_stream(transcript, self._task_batch(new_lines), max_tokens=80)
+
+    def stream_task(self, transcript: str, task: str, max_tokens: int = 60) -> AsyncIterator[str]:
+        """Произвольная короткая реплика по заданию (например, пожаловаться на шум)."""
+        return self._generate_stream(transcript, task, max_tokens=max_tokens)
 
     def stream_farewell(self, transcript: str) -> AsyncIterator[str]:
         return self._generate_stream(transcript, persona.FAREWELL_TASK, max_tokens=40)

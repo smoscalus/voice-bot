@@ -20,8 +20,18 @@ _HALLUCINATIONS = (
 _PROMPT_ECHOES = {"вася василиса", "вася василиса бот"}
 
 
-def clean_transcript(text: str) -> str | None:
+def _norm(text: str) -> str:
+    return re.sub(r"[^\w ]", "", text.lower().replace("ё", "е")).strip()
+
+
+def clean_transcript(text: str, prompt: str | None = None) -> str | None:
     t = text.strip()
+    if prompt and t:
+        # Whisper на шуме иногда «пересказывает» подсказку целиком — это не речь человека
+        from rapidfuzz import fuzz
+
+        if len(t) >= 0.5 * len(prompt) and fuzz.ratio(_norm(t), _norm(prompt)) >= 70:
+            return None
     if not t:
         return None
     low = t.lower()

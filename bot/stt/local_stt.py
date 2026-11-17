@@ -41,10 +41,15 @@ class LocalWhisperSTT:
         log.info("локальный Whisper %s на %s", self.model_size, "видеокарте" if device == "cuda" else "процессоре")
 
     async def transcribe(self, samples16k: np.ndarray, prompt: str | None = None) -> str:
+        return (await self.transcribe_scored(samples16k, prompt))[0]
+
+    async def transcribe_scored(self, samples16k: np.ndarray, prompt: str | None = None) -> tuple[str, float | None]:
         audio = samples16k.astype(np.float32) / 32768.0
         return await asyncio.to_thread(self._run, audio, prompt)
 
-    def _transcribe(self, audio: np.ndarray, prompt: str | None) -> str:
+    def _transcribe(self, audio: np.ndarray, prompt: str | None) -> tuple[str, float | None]:
+        from bot.stt.openai_stt import segments_confidence
+
         segments, _ = self.model.transcribe(
             audio,
             language=self.language,
@@ -53,9 +58,10 @@ class LocalWhisperSTT:
             vad_filter=False,  # уже нарезано нашим VAD
             condition_on_previous_text=False,
         )
-        return " ".join(s.text.strip() for s in segments).strip()
+        segments = list(segments)
+        return " ".join(s.text.strip() for s in segments).strip(), segments_confidence(segments)
 
-    def _run(self, audio: np.ndarray, prompt: str | None) -> str:
+    def _run(self, audio: np.ndarray, prompt: str | None) -> tuple[str, float | None]:
         with self._lock:
             try:
                 return self._transcribe(audio, prompt)

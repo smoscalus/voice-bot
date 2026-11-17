@@ -90,7 +90,7 @@ def _brain(provider: str) -> dict:
             llm_fallback_models=_list("GROQ_FALLBACK_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b"),
             reasoning_effort=_s("GROQ_REASONING_EFFORT", "none") or None,
             stt_backend="openai",
-            stt_model=_s("GROQ_STT_MODEL", "whisper-large-v3-turbo"),
+            stt_model=_s("GROQ_STT_MODEL", "whisper-large-v3"),  # полная — точнее turbo, на Groq не медленнее
             llm_timeout_s=12.0,
         )
     # local: Ollama на этом компьютере (или в соседнем docker-контейнере) + локальный Whisper

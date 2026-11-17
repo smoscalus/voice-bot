@@ -25,11 +25,22 @@ def stereo48_to_mono48(pcm: bytes) -> bytes:
     return mono.astype(np.int16).tobytes()
 
 
+# ФНЧ для 48→16 кГц: срез ~7 кГц (речь целиком), окно Хэмминга. Без него высокие частоты
+# «заворачиваются» в слышимый диапазон и Whisper хуже разбирает слова.
+_LOWPASS = np.sinc(np.arange(-48, 49) * 7000 / 24000) * np.hamming(97)
+_LOWPASS /= _LOWPASS.sum()
+
+
 def mono48_to_mono16(pcm: bytes) -> np.ndarray:
-    """Децимация в 3 раза с усреднением (грубый ФНЧ — для речи и STT достаточно)."""
-    a = np.frombuffer(pcm, dtype=np.int16)
-    a = a[: a.size - a.size % 3]
-    return a.reshape(-1, 3).astype(np.float32).mean(axis=1).astype(np.int16)
+    """48 кГц → 16 кГц для распознавания: нормальный фильтр + выравнивание громкости (тихие микрофоны)."""
+    a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    if a.size < 3:
+        return a.astype(np.int16)
+    x = np.convolve(a, _LOWPASS, mode="same")[::3]
+    peak = float(np.percentile(np.abs(x), 99.5))
+    if peak > 50:  # совсем тишину не раздуваем
+        x *= min(8.0, 0.5 * 32767 / peak)  # тихий голос — громче, громкий — не трогаем дальше половины шкалы
+    return np.clip(x, -32768, 32767).astype(np.int16)
 
 
 def pcm16_to_wav(samples: np.ndarray, rate: int) -> bytes:

@@ -24,7 +24,8 @@ class FallbackSTT:
         from bot.stt.openai_stt import OpenAISTT
 
         self.settings = settings
-        models = [settings.stt_model, "whisper-large-v3"]
+        other = "whisper-large-v3-turbo" if settings.stt_model == "whisper-large-v3" else "whisper-large-v3"
+        models = [settings.stt_model, other]  # у каждой модели свой дневной лимит
         self.remote = [OpenAISTT(client, m, settings.language) for i, m in enumerate(models) if m not in models[:i]]
         self._blocked_until: dict[int, float] = {}
         self._local: STTEngine | None = None
@@ -43,12 +44,15 @@ class FallbackSTT:
             return self._local
 
     async def transcribe(self, samples16k: np.ndarray, prompt: str | None = None) -> str:
+        return (await self.transcribe_scored(samples16k, prompt))[0]
+
+    async def transcribe_scored(self, samples16k: np.ndarray, prompt: str | None = None) -> tuple[str, float | None]:
         now = time.monotonic()
         for i, engine in enumerate(self.remote):
             if self._blocked_until.get(i, 0) > now:
                 continue
             try:
-                return await engine.transcribe(samples16k, prompt)
+                return await engine.transcribe_scored(samples16k, prompt)
             except openai.RateLimitError as e:
                 from bot.brain.llm import _retry_after
 
@@ -58,7 +62,7 @@ class FallbackSTT:
             except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError) as e:
                 self._blocked_until[i] = time.monotonic() + 30
                 log.warning("STT-модель %s не отвечает (%s) — переключаюсь", engine.model, type(e).__name__)
-        return await (await self._get_local()).transcribe(samples16k, prompt)
+        return await (await self._get_local()).transcribe_scored(samples16k, prompt)
 
 
 def make_stt(settings: Settings, client: AsyncOpenAI) -> STTEngine:
