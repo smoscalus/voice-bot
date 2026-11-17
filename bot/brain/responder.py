@@ -12,8 +12,15 @@ _CJK = re.compile(r"[　-鿿가-힯＀-￯]+")
 _SENT_END = re.compile(r"[.!?…]+[\"»)]?\s+")
 
 
+# эмодзи и прочие пиктограммы: голос их не прочтёт (вместо них персонаж пишет ремарки в скобках)
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️‍]+")
+# звёздочки-ремарки «*ухмыляется*» превращаем в скобки «(ухмыляется)»
+_STARS = re.compile(r"\*([^*\n]{1,60})\*")
+
+
 def _clean(text: str) -> str:
-    return re.sub(r"\s{2,}", " ", _CJK.sub("", text)).strip()
+    text = _STARS.sub(r"(\1)", _EMOJI.sub("", _CJK.sub("", text)))
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 class Responder:
