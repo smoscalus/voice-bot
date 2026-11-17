@@ -121,8 +121,17 @@ class VoiceSession:
         self.self_model.llm = memory_llm
         self.responder = Responder(
             LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t),
-            persona.SYSTEM_PROMPT, extra_context=self._relations_context,
+            self._system_prompt(settings), extra_context=self._relations_context,
             recent_lines=lambda: list(self._my_lines))
+
+    @staticmethod
+    def _system_prompt(settings: Settings) -> str:
+        """Полный характер для сильных моделей (облако), облегчённый — для локальных: маленькая модель
+        путается в длинном списке правил и начинает допрашивать людей. PERSONA_PROMPT=full/lite — вручную."""
+        style = settings.persona_prompt
+        if style == "auto":
+            style = "lite" if settings.provider == "local" else "full"
+        return persona.SYSTEM_PROMPT_LITE if style == "lite" else persona.SYSTEM_PROMPT
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:

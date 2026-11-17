@@ -76,6 +76,7 @@ class Settings:
     interest_per_line: float  # «интерес» от любой реплики людей (тролль лезет чаще)
     sfx_enabled: bool  # «угу»/«хм…» голосом бота
     own_initiative_gap_s: float  # «свои дела»: сам начинает тему не чаще, чем раз в столько секунд
+    persona_prompt: str  # auto / full / lite — полный или облегчённый характер (lite — для локальных моделей)
 
 
 def _brain(provider: str) -> dict:
@@ -157,4 +158,5 @@ def load_settings(provider: str | None = None) -> Settings:
         interest_per_line=_f("INTEREST_PER_LINE", 0.7),
         sfx_enabled=_s("SFX", "off").lower() in ("on", "1", "true"),
         own_initiative_gap_s=_f("OWN_INITIATIVE_GAP_S", 600),
+        persona_prompt=_s("PERSONA_PROMPT", "auto").lower(),
     )
