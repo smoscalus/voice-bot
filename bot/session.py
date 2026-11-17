@@ -187,7 +187,8 @@ class VoiceSession:
             # barge-in: заговорили поверх бота — он замолкает (как голосовой режим ChatGPT).
             # Инициативную реплику обрываем быстрее, прямой ответ — если говорят дольше barge_in_ms.
             if self.player.is_playing:
-                need_ms = 400 if self._speaking_proactive else self.s.barge_in_ms
+                # BARGE_IN_MS=0 — «танк»: голосом не перебить вообще, всегда договаривает мысль
+                need_ms = 0 if self.s.barge_in_ms <= 0 else (400 if self._speaking_proactive else self.s.barge_in_ms)
                 if need_ms > 0 and self.segmenter.someone_speaking(
                         min_voiced_ms=need_ms, started_after=self.player.started_at):
                     log.info("barge-in: меня перебили — замолкаю")

@@ -152,7 +152,7 @@ def load_settings(provider: str | None = None) -> Settings:
         attention_window_s=_f("ATTENTION_WINDOW_S", 8),
         quiet_gap_s=_f("QUIET_GAP_S", 0.8),
         classifier_max_per_hour=_i("CLASSIFIER_MAX_PER_HOUR", 60),
-        barge_in_ms=_i("BARGE_IN_MS", 900),
+        barge_in_ms=_i("BARGE_IN_MS", 0),
         interest_per_line=_f("INTEREST_PER_LINE", 0.7),
         sfx_enabled=_s("SFX", "off").lower() in ("on", "1", "true"),
     )
