@@ -44,10 +44,14 @@ class VoiceBot(commands.Bot):
         elif settings.openai_api_key in ("", "none"):
             raise RuntimeError("для PROVIDER=groq нужен GROQ_API_KEY в .env (бесплатно на console.groq.com)")
         client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
-        stt_key = f"{settings.provider}:{settings.stt_backend}"
+        # распознавание может идти не туда же, куда мозги (локальная Ollama + Whisper в облаке Groq)
+        stt_client = (AsyncOpenAI(api_key=settings.stt_api_key, base_url=settings.stt_base_url)
+                      if settings.stt_backend == "openai" and settings.stt_base_url != settings.openai_base_url
+                      else client)
+        stt_key = f"{settings.stt_backend}:{settings.stt_base_url}"
         if stt_key not in self._stt_cache:
             log.info("готовлю распознавание речи (%s)… при первом запуске модель скачивается", stt_key)
-            self._stt_cache[stt_key] = await asyncio.to_thread(make_stt, settings, client)
+            self._stt_cache[stt_key] = await asyncio.to_thread(make_stt, settings, stt_client)
         self.settings, self.openai, self.stt = settings, client, self._stt_cache[stt_key]
         await self._warmup_llm()
         log.info("мозги: %s (%s)", settings.provider, settings.llm_model)

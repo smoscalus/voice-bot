@@ -70,7 +70,7 @@ def make_stt(settings: Settings, client: AsyncOpenAI) -> STTEngine:
         from bot.stt.local_stt import LocalWhisperSTT
 
         return LocalWhisperSTT(settings.local_whisper_model, settings.local_whisper_device, settings.language)
-    if settings.openai_base_url and "groq" in settings.openai_base_url:
+    if settings.stt_base_url and "groq" in settings.stt_base_url:
         return FallbackSTT(settings, client)
     from bot.stt.openai_stt import OpenAISTT
 

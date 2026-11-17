@@ -8,6 +8,7 @@ write() вызывается из отдельного потока, по одн
 from __future__ import annotations
 
 import logging
+import re
 
 import discord
 from discord.ext import voice_recv
@@ -17,6 +18,20 @@ from bot.audio.segmenter import UtteranceSegmenter
 
 log = logging.getLogger(__name__)
 dave_patch.apply()
+
+
+def speakable_name(user: discord.Member | discord.User) -> str:
+    """Имя, которое голос сможет прочитать: из «! 東京 太郎» или «★xX_Pro_Xx★» делаем что-то человеческое.
+    Берём ник на сервере, а если в нём нет ни русских, ни латинских букв — имя аккаунта."""
+    for raw in (getattr(user, "display_name", ""), getattr(user, "global_name", None), user.name):
+        if not raw:
+            continue
+        name = re.sub(r"[^A-Za-zА-Яа-яЁёІіЇїЄєҐґ0-9 _\-]", " ", raw)
+        name = re.sub(r"[_\-]+", " ", name)
+        name = re.sub(r"\s+", " ", name).strip()
+        if re.search(r"[A-Za-zА-Яа-яЁёІіЇїЄєҐґ]", name):
+            return name[:32]
+    return "аноним"
 
 
 class SegmentingSink(voice_recv.AudioSink):
@@ -32,7 +47,7 @@ class SegmentingSink(voice_recv.AudioSink):
         if user is None or user.bot or not data.pcm:
             return
         try:
-            self.segmenter.feed(user.id, user.display_name, data.pcm)
+            self.segmenter.feed(user.id, speakable_name(user), data.pcm)
         except Exception:
             # исключение здесь убивает весь поток приёма voice-recv — бот глохнет насовсем.
             # Поэтому один кривой кадр просто пропускаем.

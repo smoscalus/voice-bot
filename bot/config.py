@@ -43,6 +43,8 @@ class Settings:
 
     stt_backend: str
     stt_model: str
+    stt_base_url: str | None  # куда слать распознавание (может отличаться от мозгов: Ollama + Groq Whisper)
+    stt_api_key: str
     local_whisper_model: str
     local_whisper_device: str
     language: str
@@ -93,6 +95,8 @@ def _brain(provider: str) -> dict:
             reasoning_effort=_s("GROQ_REASONING_EFFORT", "none") or None,
             stt_backend="openai",
             stt_model=_s("GROQ_STT_MODEL", "whisper-large-v3"),  # полная — точнее turbo, на Groq не медленнее
+            stt_base_url="https://api.groq.com/openai/v1",
+            stt_api_key=key or "none",
             llm_timeout_s=12.0,
         )
     # local: Ollama на этом компьютере (или в соседнем docker-контейнере) + локальный Whisper
@@ -105,10 +109,20 @@ def _brain(provider: str) -> dict:
         memory_model=_s("OLLAMA_MEMORY_MODEL", model),
         llm_fallback_models=[],
         reasoning_effort=None,
-        stt_backend="local",
-        stt_model="",
+        # распознавание: STT_PROVIDER=auto — через Groq, если есть ключ (быстро и точно, а мозги всё равно локальные),
+        # иначе локальный Whisper; local / groq — выбрать вручную
+        **_stt_for_local(),
         llm_timeout_s=_f("OLLAMA_TIMEOUT_S", 90),
     )
+
+
+def _stt_for_local() -> dict:
+    key = os.getenv("GROQ_API_KEY") or (os.getenv("OPENAI_API_KEY", "") if os.getenv("OPENAI_API_KEY", "").startswith("gsk_") else "")
+    choice = _s("STT_PROVIDER", "auto").lower()
+    if choice == "groq" or (choice == "auto" and key):
+        return dict(stt_backend="openai", stt_model=_s("GROQ_STT_MODEL", "whisper-large-v3"),
+                    stt_base_url="https://api.groq.com/openai/v1", stt_api_key=key or "none")
+    return dict(stt_backend="local", stt_model="", stt_base_url=None, stt_api_key="none")
 
 
 def has_groq_key() -> bool:
@@ -134,7 +148,7 @@ def load_settings(provider: str | None = None) -> Settings:
         piper_liveliness=_f("PIPER_LIVELINESS", 0.667),
         azure_speech_key=_s("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_s("AZURE_SPEECH_REGION", "westeurope"),
-        local_whisper_model=_s("LOCAL_WHISPER_MODEL", "small"),
+        local_whisper_model=_s("LOCAL_WHISPER_MODEL", "auto"),  # auto: small на видеокарте, base на процессоре
         local_whisper_device=_s("LOCAL_WHISPER_DEVICE", "auto"),
         language=_s("LANGUAGE", "ru"),
         tts_model=_s("TTS_MODEL", "gpt-4o-mini-tts"),

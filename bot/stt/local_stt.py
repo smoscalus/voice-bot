@@ -25,7 +25,7 @@ def _cuda_available() -> bool:
 
 class LocalWhisperSTT:
     def __init__(self, model_size: str, device: str, language: str):
-        self.model_size = model_size
+        self.model_size = model_size  # "auto" — small на видеокарте, base на процессоре (small на CPU не успевает за компанией)
         self.language = language
         self._lock = threading.Lock()  # одна модель — один инференс за раз
         want_cuda = device == "cuda" or (device == "auto" and _cuda_available())
@@ -36,9 +36,10 @@ class LocalWhisperSTT:
         from faster_whisper import WhisperModel
 
         compute_type = "int8_float16" if device == "cuda" else "int8"
-        self.model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+        size = self.model_size if self.model_size != "auto" else ("small" if device == "cuda" else "base")
+        self.model = WhisperModel(size, device=device, compute_type=compute_type)
         self.device = device
-        log.info("локальный Whisper %s на %s", self.model_size, "видеокарте" if device == "cuda" else "процессоре")
+        log.info("локальный Whisper %s на %s", size, "видеокарте" if device == "cuda" else "процессоре")
 
     async def transcribe(self, samples16k: np.ndarray, prompt: str | None = None) -> str:
         return (await self.transcribe_scored(samples16k, prompt))[0]

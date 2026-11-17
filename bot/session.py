@@ -44,6 +44,7 @@ UNCLEAR_CONFIDENCE = -0.8   # avg_logprob Whisper ниже этого — фра
 NOISE_MIN_LINES = 5         # сколько фраз за минуту смотреть, чтобы решить «вокруг шум»
 NOISE_UNCLEAR_SHARE = 0.6   # доля неразборчивых среди них
 NOISE_COMPLAINT_EVERY_S = 300
+STALE_UTTERANCE_S = 12      # фразы, ждавшие распознавания дольше, — выкидываем (бот отстал)
 OWN_CHECK_EVERY_S = 15      # как часто бот прикидывает «а не заговорить ли самому»
 OWN_LULL_S = 20             # сколько секунд тишины нужно, чтобы самому начать тему
 OWN_MIN_HUNGER = 0.6        # только когда сильно хочет (голод на провокации)
@@ -98,6 +99,7 @@ class VoiceSession:
         self._my_lines: deque[str] = deque(maxlen=12)  # свои последние реплики — чтобы не повторяться
         self._clarity: deque[tuple[float, bool]] = deque(maxlen=12)  # (когда, неразборчиво ли) — детектор шума
         self._last_noise_complaint = 0.0
+        self._stale_dropped = 0
         self._last_own_initiative = time.monotonic()  # «свои дела» — не сразу после захода
         self._next_own_check = 0.0
         self._tasks: set[asyncio.Task] = set()
@@ -276,6 +278,16 @@ class VoiceSession:
         self._stt_inflight += 1
         try:
             async with self._stt_sem:
+                # распознавание не успевает (слабый процессор, много людей) — старые фразы выкидываем,
+                # иначе очередь копится и бот отвечает на то, что сказали полминуты назад
+                age = time.time() - (utt.started_at + utt.duration_s)
+                if age > STALE_UTTERANCE_S:
+                    self._stale_dropped += 1
+                    if self._stale_dropped % 5 == 1:
+                        log.warning("распознавание не успевает: выкинул устаревшую фразу (%.0f с), всего %d. "
+                                    "Помогут LOCAL_WHISPER_MODEL=base/tiny или распознавание через Groq",
+                                    age, self._stale_dropped)
+                    return
                 try:
                     samples = mono48_to_mono16(utt.pcm_mono48)
                     if hasattr(self.stt, "transcribe_scored"):

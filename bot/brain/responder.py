@@ -108,6 +108,7 @@ def find_parrot(sentence: str, heard: list[str]) -> str | None:
 
 
 _SELF_ADDRESS = re.compile(rf"^\s*{persona.BOT_NAME}\s*[,!.:]\s*", re.IGNORECASE)
+_NAME_GREETING_ONLY = re.compile(r"^\s*[^,.!?]{1,30},\s*(привет|здорово|здарова|хай)\s*[.!]*\s*$", re.IGNORECASE)
 _LEADING_GREETING = re.compile(r"^\s*(привет|здорово|здарова|хай)\s*[,!.]?\s*", re.IGNORECASE)
 
 
@@ -115,6 +116,8 @@ def _tidy(sentence: str, greeted: bool) -> str:
     """Убираем обращение бота к самому себе («Петрык, привет») и повторное «привет», если уже здоровался."""
     s = _SELF_ADDRESS.sub("", sentence)
     if greeted:
+        if _NAME_GREETING_ONLY.match(s):  # «Вася, привет.» отдельной фразой — уже здоровался, выкидываем
+            return ""
         s = _LEADING_GREETING.sub("", s)
     s = s.strip()
     return (s[0].upper() + s[1:]) if s else s

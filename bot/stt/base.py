@@ -32,6 +32,11 @@ def clean_transcript(text: str, prompt: str | None = None) -> str | None:
 
         if len(t) >= 0.5 * len(prompt) and fuzz.ratio(_norm(t), _norm(prompt)) >= 70:
             return None
+        # или «Петрык. Дота, катка, мид, мид, мид, кринж, кринж…» — почти все слова из подсказки
+        vocab = {w[:5] for w in _norm(prompt).split()}
+        words = [w[:5] for w in _norm(t).split()]
+        if len(words) >= 4 and sum(w in vocab for w in words) / len(words) >= 0.7:
+            return None
     if not t:
         return None
     low = t.lower()
