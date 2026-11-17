@@ -104,6 +104,16 @@ class Responder:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         return self._guarded_stream(transcript, self._task_batch(new_lines), max_tokens=80)
 
+    async def reply_task(self, transcript: str, task: str, max_tokens: int = 100) -> str:
+        """Реплика по заданию целиком (нужно, когда ответ сначала проверяем — например, «ПРОПУСК»)."""
+        resp = await self.llm.create(messages=self._messages(transcript, task), max_completion_tokens=max_tokens)
+        text = _clean(resp.choices[0].message.content or "")
+        recent = self.recent_lines() if self.recent_lines else []
+        if text and find_repeat(text, recent):
+            log.info("своя тема повторяет старое («%s») — промолчу", text)
+            return ""
+        return text
+
     def stream_task(self, transcript: str, task: str, max_tokens: int = 60) -> AsyncIterator[str]:
         """Произвольная короткая реплика по заданию (например, пожаловаться на шум)."""
         return self._generate_stream(transcript, task, max_tokens=max_tokens)

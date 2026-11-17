@@ -75,6 +75,7 @@ class Settings:
     barge_in_ms: int  # сколько мс надо проговорить поверх бота, чтобы он замолчал (0 = выкл)
     interest_per_line: float  # «интерес» от любой реплики людей (тролль лезет чаще)
     sfx_enabled: bool  # «угу»/«хм…» голосом бота
+    own_initiative_gap_s: float  # «свои дела»: сам начинает тему не чаще, чем раз в столько секунд
 
 
 def _brain(provider: str) -> dict:
@@ -145,8 +146,8 @@ def load_settings(provider: str | None = None) -> Settings:
         buffer_max_lines=_i("BUFFER_MAX_LINES", 40),
         prefilter_threshold=_f("PREFILTER_THRESHOLD", 2.5),
         interest_confidence=_f("INTEREST_CONFIDENCE", 0.6),
-        proactive_cooldown_s=_f("PROACTIVE_COOLDOWN_S", 40),
-        proactive_max_per_10min=_i("PROACTIVE_MAX_PER_10MIN", 8),
+        proactive_cooldown_s=_f("PROACTIVE_COOLDOWN_S", 90),
+        proactive_max_per_10min=_i("PROACTIVE_MAX_PER_10MIN", 5),
         min_gap_after_bot_s=_f("MIN_GAP_AFTER_BOT_S", 12),
         follow_up_window_s=_f("FOLLOW_UP_WINDOW_S", 20),
         attention_window_s=_f("ATTENTION_WINDOW_S", 8),
@@ -155,4 +156,5 @@ def load_settings(provider: str | None = None) -> Settings:
         barge_in_ms=_i("BARGE_IN_MS", 0),
         interest_per_line=_f("INTEREST_PER_LINE", 0.7),
         sfx_enabled=_s("SFX", "off").lower() in ("on", "1", "true"),
+        own_initiative_gap_s=_f("OWN_INITIATIVE_GAP_S", 600),
     )

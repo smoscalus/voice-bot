@@ -44,6 +44,10 @@ UNCLEAR_CONFIDENCE = -0.8   # avg_logprob Whisper ниже этого — фра
 NOISE_MIN_LINES = 5         # сколько фраз за минуту смотреть, чтобы решить «вокруг шум»
 NOISE_UNCLEAR_SHARE = 0.6   # доля неразборчивых среди них
 NOISE_COMPLAINT_EVERY_S = 300
+OWN_CHECK_EVERY_S = 15      # как часто бот прикидывает «а не заговорить ли самому»
+OWN_LULL_S = 20             # сколько секунд тишины нужно, чтобы самому начать тему
+OWN_MIN_HUNGER = 0.6        # только когда сильно хочет (голод на провокации)
+OWN_CHANCE = 0.35           # и не при каждой возможности
 
 
 class VoiceSession:
@@ -94,6 +98,8 @@ class VoiceSession:
         self._my_lines: deque[str] = deque(maxlen=12)  # свои последние реплики — чтобы не повторяться
         self._clarity: deque[tuple[float, bool]] = deque(maxlen=12)  # (когда, неразборчиво ли) — детектор шума
         self._last_noise_complaint = 0.0
+        self._last_own_initiative = time.monotonic()  # «свои дела» — не сразу после захода
+        self._next_own_check = 0.0
         self._tasks: set[asyncio.Task] = set()
 
     def set_brain(self, settings: Settings, client: AsyncOpenAI, stt: STTEngine) -> None:
@@ -192,6 +198,7 @@ class VoiceSession:
     def _tick(self) -> None:
         if True:
             self.segmenter.flush_stale()
+            self._maybe_own_initiative()
             # страховка: приём звука выключился (кто-то вызвал vc.stop() и т.п.) — включаем обратно
             if not self._reconnecting and self.vc.is_connected() and not self.vc.is_listening():
                 log.warning("приём звука был выключен — включаю обратно")
@@ -321,6 +328,36 @@ class VoiceSession:
         await asyncio.sleep(min(2.5, self.s.attention_window_s))
         if self.policy.take_attention(user_id):  # продолжения не было
             self._request_reply(utt_end)
+
+    def _maybe_own_initiative(self) -> None:
+        """Свои дела: в затишье бот иногда сам начинает тему — редко и только когда очень хочет."""
+        now = time.monotonic()
+        if now < self._next_own_check:
+            return
+        self._next_own_check = now + OWN_CHECK_EVERY_S
+        last_human = max((l.end_ts or l.ts for l in self.buffer.recent(10) if not l.is_bot), default=0.0)
+        if (not self.proactive_enabled or self._reconnecting or self.player.is_playing or self._reply_busy()
+                or now - self._last_own_initiative < self.s.own_initiative_gap_s
+                or now - self.policy.last_spoke < 60
+                or self.segmenter.seconds_since_last_voice() < OWN_LULL_S
+                or time.time() - last_human > 600          # в канале давно тишина — говорить не с кем
+                or self.drive.hunger < OWN_MIN_HUNGER
+                or random.random() > OWN_CHANCE):
+            return
+        self._last_own_initiative = now
+        self._spawn(self._own_initiative())
+
+    async def _own_initiative(self) -> None:
+        try:
+            text = await self.responder.reply_task(self.buffer.render(self.buffer.recent(20)), persona.OWN_INITIATIVE_TASK)
+        except Exception:
+            log.exception("свои дела: не смог придумать")
+            return
+        if not text or "ПРОПУСК" in text.upper() or self.segmenter.seconds_since_last_voice() < 3:
+            log.info("свои дела: решил промолчать")
+            return
+        log.info("свои дела: сам начинаю тему")
+        await self._speak(text, proactive=True)
 
     def _note_clarity(self, unclear: bool) -> None:
         """Если за последнюю минуту большинство фраз — каша, бот говорит, что ничего не понимает (не чаще раза в 5 мин)."""
