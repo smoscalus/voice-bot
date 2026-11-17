@@ -63,19 +63,38 @@ if ($provider -eq "local") {
     } else {
         Set-EnvValue "DOCKER_OLLAMA_URL" "http://ollama:11434"
         $composeArgs += @("-f", "docker-compose.yml")
+        # nvidia-smi может лежать в системе и без рабочей видеокарты NVIDIA — проверяем, что он её реально видит
+        $nvidia = $false
         if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
-            Say "Видеокарта NVIDIA найдена — Ollama будет считать на ней." "Green"
-            $composeArgs += @("-f", "docker-compose.gpu.yml")
-        } else {
-            Say "Видеокарты NVIDIA нет — Ollama будет на процессоре (медленнее). Совет: OLLAMA_MODEL=qwen2.5:3b в .env" "Yellow"
+            nvidia-smi -L *> $null
+            if ($LASTEXITCODE -eq 0) { $nvidia = $true }
         }
-        $composeArgs += @("--profile", "local")
+        if ($nvidia) {
+            Say "Видеокарта NVIDIA найдена — попробую считать на ней." "Green"
+            $gpuArgs = @("-f", "docker-compose.gpu.yml")
+        } else {
+            Say "Видеокарты NVIDIA нет — Ollama в Docker будет на процессоре (медленно)." "Yellow"
+            Say "Совет: поставь Ollama прямо на Windows с ollama.com (умеет и AMD) и запусти start.bat снова." "Yellow"
+            $gpuArgs = @()
+        }
+        $localArgs = @("--profile", "local")
     }
 }
 
 # 4. Поехали
 Say "`nСобираю и запускаю (первый раз — несколько минут: скачиваются зависимости и модели)…" "Cyan"
-& docker @composeArgs up -d --build
+if ($provider -eq "local" -and $localArgs) {
+    & docker @composeArgs @gpuArgs @localArgs up -d --build
+    if ($LASTEXITCODE -ne 0 -and $gpuArgs.Count -gt 0) {
+        # Docker не смог отдать видеокарту контейнеру (частая история на Windows) — запускаемся без неё
+        Say "`nDocker не видит видеокарту — запускаю Ollama на процессоре (медленнее)." "Yellow"
+        Say "Совет: поставь Ollama прямо на Windows с ollama.com — она возьмёт видеокарту сама." "Yellow"
+        & docker compose --profile local down *> $null
+        & docker @composeArgs @localArgs up -d --build
+    }
+} else {
+    & docker @composeArgs up -d --build
+}
 if ($LASTEXITCODE -ne 0) { Fail "Не удалось запустить. Посмотри сообщение выше." }
 
 Say "`nБот запущен в фоне. Зайди в голосовой канал и напиши /join" "Green"

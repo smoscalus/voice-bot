@@ -51,17 +51,28 @@ if [ "$provider" = "local" ]; then
   else
     set_env DOCKER_OLLAMA_URL "http://ollama:11434"
     args+=(-f docker-compose.yml)
-    if command -v nvidia-smi >/dev/null 2>&1; then
-      say "Видеокарта NVIDIA найдена — Ollama будет считать на ней."
-      args+=(-f docker-compose.gpu.yml)
+    # nvidia-smi бывает и без рабочей видеокарты — проверяем, что он её реально видит
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+      say "Видеокарта NVIDIA найдена — попробую считать на ней."
+      gpu=(-f docker-compose.gpu.yml)
     else
-      say "Видеокарты NVIDIA нет — Ollama на процессоре (медленнее). Совет: OLLAMA_MODEL=qwen2.5:3b в .env"
+      say "Видеокарты NVIDIA нет — Ollama на процессоре (медленнее). Совет: поставь Ollama прямо на систему (ollama.com)"
+      gpu=()
     fi
-    args+=(--profile local)
+    local_profile=(--profile local)
   fi
 fi
 
 say "Собираю и запускаю (первый раз — несколько минут)…"
-docker "${args[@]}" up -d --build
+if [ -n "${local_profile+x}" ]; then
+  if ! docker "${args[@]}" ${gpu[@]+"${gpu[@]}"} "${local_profile[@]}" up -d --build; then
+    [ ${#gpu[@]} -gt 0 ] || fail "Не удалось запустить. Посмотри сообщение выше."
+    say "Docker не видит видеокарту — запускаю Ollama на процессоре (медленнее)."
+    docker compose --profile local down >/dev/null 2>&1 || true
+    docker "${args[@]}" "${local_profile[@]}" up -d --build || fail "Не удалось запустить. Посмотри сообщение выше."
+  fi
+else
+  docker "${args[@]}" up -d --build || fail "Не удалось запустить. Посмотри сообщение выше."
+fi
 say "Бот запущен. Зайди в голосовой канал и напиши /join. Остановить: docker compose --profile local stop"
 docker compose logs -f --tail 50 bot
