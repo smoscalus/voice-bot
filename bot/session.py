@@ -115,7 +115,8 @@ class VoiceSession:
         self.self_model.llm = memory_llm
         self.responder = Responder(
             LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t),
-            persona.SYSTEM_PROMPT, extra_context=self._relations_context)
+            persona.SYSTEM_PROMPT, extra_context=self._relations_context,
+            recent_lines=lambda: list(self._my_lines))
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:

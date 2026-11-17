@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import AsyncIterator
 
 from bot import persona
 from bot.brain.llm import LLMRouter
+
+log = logging.getLogger(__name__)
 
 # Qwen иногда вставляет китайские/корейские слова — голос их не прочтёт, вырезаем
 _CJK = re.compile(r"[　-鿿가-힯＀-￯]+")
@@ -28,11 +31,44 @@ def _clean(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+_REMARK = re.compile(r"\([^)]{0,60}\)")
+_GREETING = re.compile(r"^(привет|здорово|здарова|хай|йо|ну|слушай|эй|о)\b[\s,!.]*", re.IGNORECASE)
+
+
+def _norm_for_repeat(text: str) -> str:
+    """Для сравнения: без ремарок в скобках, приветствий в начале, знаков и регистра."""
+    t = _REMARK.sub(" ", text.lower().replace("ё", "е"))
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    for _ in range(2):  # «привет, слушай, …»
+        t = _GREETING.sub("", t).strip()
+    return t
+
+
+def find_repeat(sentence: str, recent: list[str], threshold: int = 80) -> str | None:
+    """Если фраза повторяет (почти дословно или по смыслу набора слов) что-то из недавних реплик — вернёт ту фразу.
+    Короткие ответы («нормально», «не знаю») повторами не считаем — это норма."""
+    from rapidfuzz import fuzz
+
+    s = _norm_for_repeat(sentence)
+    if len(s.split()) < 3:
+        return None
+    for line in recent:
+        for old in re.split(r"(?<=[.!?…])\s+", line):
+            o = _norm_for_repeat(old)
+            if len(o.split()) < 3:
+                continue
+            if fuzz.token_set_ratio(s, o) >= threshold or fuzz.ratio(s, o) >= threshold - 5:
+                return old.strip()
+    return None
+
+
 class Responder:
-    def __init__(self, llm: LLMRouter, system_prompt: str, extra_context=None):
+    def __init__(self, llm: LLMRouter, system_prompt: str, extra_context=None, recent_lines=None):
         self.llm = llm
         self.system_prompt = system_prompt
         self.extra_context = extra_context  # функция → доп. текст в системный промпт (отношения к людям)
+        self.recent_lines = recent_lines    # функция → последние реплики бота (для защиты от повторов)
 
     # ---------------------------------------------------------------- задачи
     @staticmethod
@@ -66,7 +102,7 @@ class Responder:
     # ---------------------------------------------------------------- потоково, по предложениям
     def stream_batch(self, transcript: str, new_lines: str) -> AsyncIterator[str]:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
-        return self._generate_stream(transcript, self._task_batch(new_lines), max_tokens=80)
+        return self._guarded_stream(transcript, self._task_batch(new_lines), max_tokens=80)
 
     def stream_task(self, transcript: str, task: str, max_tokens: int = 60) -> AsyncIterator[str]:
         """Произвольная короткая реплика по заданию (например, пожаловаться на шум)."""
@@ -76,7 +112,32 @@ class Responder:
         return self._generate_stream(transcript, persona.FAREWELL_TASK, max_tokens=40)
 
     def stream_proactive(self, transcript: str, topic: str, angle: str) -> AsyncIterator[str]:
-        return self._generate_stream(transcript, self._task_proactive(topic, angle), max_tokens=100)
+        return self._guarded_stream(transcript, self._task_proactive(topic, angle), max_tokens=100)
+
+    async def _guarded_stream(self, transcript: str, task: str, max_tokens: int) -> AsyncIterator[str]:
+        """Поток ответа с защитой от повторов: если первая фраза повторяет недавнюю реплику бота —
+        выбрасываем её и генерируем заново с явным запретом; повторы дальше в ответе просто пропускаем."""
+        recent = self.recent_lines() if self.recent_lines else []
+        gen = self._generate_stream(transcript, task, max_tokens)
+        first = None
+        async for sentence in gen:
+            first = sentence
+            break
+        if first is not None and (same := find_repeat(first, recent)):
+            await gen.aclose()
+            log.info("повтор «%s» (уже говорил «%s») — придумываю заново", first, same)
+            task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{same}». НЕ повторяй это и не задавай этот вопрос снова "
+                    "(даже другими словами). Скажи что-то другое: ответь по сути, подколи за реакцию, "
+                    "смени тему или просто отстань.")
+            gen = self._generate_stream(transcript, task, max_tokens)
+            first = None
+        if first is not None:
+            yield first
+        async for sentence in gen:
+            if find_repeat(sentence, recent):
+                log.info("пропускаю повтор в ответе: «%s»", sentence)
+                continue
+            yield sentence
 
     def _messages(self, transcript: str, task: str) -> list[dict]:
         system = self.system_prompt
