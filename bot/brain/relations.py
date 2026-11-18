@@ -48,7 +48,8 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
 2) world — что бот УЗНАЛ О МИРЕ из этих реплик (до 6 пунктов): что значат слова и понятия, как что
 устроено, что люди рассказали или объяснили — особенно в ответ на вопросы бота. Не про конкретных людей
 (это в досье) и не про самого бота (что он чувствует или не понимает — это его дневник, не сюда).
-Каждый пункт — короткий факт, как его понял бот, по-русски, и кто рассказал.
+Каждый пункт — короткий факт, как его понял бот, по-русски, и кто рассказал. important=true — если это
+сильно его задело (о его жизни, смерти, о нём самом, что-то страшное или очень радостное).
 Ничего не добавляй от себя — только то, что реально прозвучало. НЕ записывай слова, смысл которых
 так и не объяснили («слово X не имеет ясного значения» — не знание), и обрывки неразборчивой речи.
 Нечего — пустой список.
@@ -60,7 +61,7 @@ sadness (грусть: игнорировали, обижали, грустны�
 
 Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
-  "world": [{{"text": "факт", "source": "ник"}}],
+  "world": [{{"text": "факт", "source": "ник", "important": true|false}}],
   "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}}}}"""
 
 
@@ -72,6 +73,7 @@ class Relation:
     plans: list[str] = field(default_factory=list)
     hooks: list[str] = field(default_factory=list)
     updated: float = 0.0
+    last_seen_lived: float = 0.0   # когда видел его последний раз (по своему ощущению времени)
     # устаревшие поля прошлых версий — подхватываются как факты
     notes: list[str] = field(default_factory=list)
     profile: str = ""
@@ -135,11 +137,17 @@ class RelationsStore:
 
     def prompt_block(self, participants: dict[str, int | None]) -> str:
         """Кусок промпта: досье и отношение к тем, кто сейчас в разговоре."""
+        from bot.brain.life import duration, get_life
+
+        life = get_life()
         lines = []
         for name, uid in participants.items():
             rel = self.get(uid, name)
             d = rel.dossier()
-            lines.append(f"- {name}: симпатия {rel.score:+.0f}/10 — {describe(rel.score)}." + (f" Досье — {d}." if d else ""))
+            gap = life.lived_s - rel.last_seen_lived if rel.last_seen_lived else 0
+            seen = f" Не видел его {duration(gap)} (по твоему ощущению)." if gap > 3600 else ""
+            lines.append(f"- {name}: симпатия {rel.score:+.0f}/10 — {describe(rel.score)}." + (f" Досье — {d}." if d else "")
+                         + seen)
         if not lines:
             return ""
         from bot import persona
@@ -154,9 +162,9 @@ def get_store() -> RelationsStore:
     """Одно хранилище на весь бот; у каждого персонажа своя память (data/relations_<имя>.json)."""
     global _STORE
     if _STORE is None:
-        from bot import persona
+        from bot.brain.life import memory_id
 
-        _STORE = RelationsStore(Path(f"data/relations_{persona.MEMORY_ID}.json"))
+        _STORE = RelationsStore(Path(f"data/relations_{memory_id()}.json"))
     return _STORE
 
 
@@ -248,6 +256,11 @@ class RelationsJudge:
             except Exception as e:
                 log.warning("не смог обновить память: %s", e)
                 return
+            from bot.brain.life import get_life
+
+            now_lived = get_life().lived_s
+            for n, uid in humans.items():
+                self.store.get(uid, n).last_seen_lived = now_lived
             for ch in changes:
                 name = _match_name(str(ch.get("name", "")), humans)
                 if name is None:
@@ -274,11 +287,10 @@ class RelationsJudge:
             if isinstance(data.get("feelings"), dict):
                 get_emotions().apply(data["feelings"])
             # что узнал о мире — в отдельную память знаний; новое утоляет любопытство
-            world = [(str(w.get("text", "")), str(w.get("source", ""))) for w in (data.get("world") or [])
-                     if isinstance(w, dict)]
+            world = [(str(w.get("text", "")), str(w.get("source", "")), w.get("important") is True)
+                     for w in (data.get("world") or []) if isinstance(w, dict)]
             knowledge = get_knowledge()
             new = knowledge.add(world)
             if new:
                 log.info("узнал о мире: %s", "; ".join(f.text for f in knowledge.facts[-new:]))
                 get_drive().on_learned(new)
-            asyncio.create_task(knowledge.maybe_compress(self.llm))

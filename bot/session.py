@@ -30,6 +30,7 @@ from bot.brain.interest import InterestClassifier
 from bot.brain.drive import get_drive
 from bot.brain.emotions import get_emotions
 from bot.brain.knowledge import get_knowledge
+from bot.brain.life import bury, dream, get_life, write_epitaph
 from bot.brain.llm import LLMRouter
 from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
@@ -98,6 +99,10 @@ class VoiceSession:
         self._seen_users: set[int] = set()   # кто уже говорил в этой сессии
         self._returning: set[str] = set()    # вернулись, и на них есть материал в памяти
         self.drive = get_drive()              # любопытство: растёт без нового, падает, когда узнал
+        self.dead = False
+        self.on_closed = None                 # main.py: убрать сессию из списка, когда он умер
+        self._next_life_check = 0.0
+        self._life_busy = False
         self._my_lines: deque[str] = deque(maxlen=12)  # свои последние реплики — чтобы не повторяться
         self._clarity: deque[tuple[float, bool]] = deque(maxlen=12)  # (когда, неразборчиво ли) — детектор шума
         self._last_noise_complaint = 0.0
@@ -145,6 +150,8 @@ class VoiceSession:
         log.info("session started in #%s", self.vc.channel)
 
     async def stop(self, farewell: bool = False) -> None:
+        if self.dead:
+            return  # уже умер: память похоронена, ничего не дописываем
         if farewell and self.vc.is_connected():
             try:  # последние слова перед «смертью»
                 await asyncio.wait_for(self._speak_stream(
@@ -168,7 +175,8 @@ class VoiceSession:
     def _relations_context(self) -> str:
         """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
-        blocks = [get_knowledge().prompt_block(), self.self_model.prompt_block(),
+        query = " ".join(l.text for l in self.buffer.recent(6))  # о чём сейчас речь — что из памяти вспомнить
+        blocks = [get_life().prompt_block(), get_knowledge().prompt_block(query), self.self_model.prompt_block(),
                   self.relations.prompt_block(participants), self.drive.prompt_block(),
                   get_emotions().prompt_block(), self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
@@ -209,6 +217,7 @@ class VoiceSession:
         if True:
             self.segmenter.flush_stale()
             self._maybe_own_initiative()
+            self._maybe_life_events()
             # страховка: приём звука выключился (кто-то вызвал vc.stop() и т.п.) — включаем обратно
             if not self._reconnecting and self.vc.is_connected() and not self.vc.is_listening():
                 log.warning("приём звука был выключен — включаю обратно")
@@ -378,6 +387,69 @@ class VoiceSession:
             return
         log.info("свои дела: сам начинаю тему")
         await self._speak(text, proactive=True)
+
+    # ------------------------------------------------------------------ жизнь: сны и смерть
+    def _maybe_life_events(self) -> None:
+        """Раз в 5 с: не пора ли увидеть сон (после тускнения памяти) или умереть (срок вышел)."""
+        now = time.monotonic()
+        if now < self._next_life_check or self._life_busy or self.dead:
+            return
+        self._next_life_check = now + 5
+        if self._reconnecting or self.player.is_playing or self._reply_busy():
+            return
+        life = get_life()
+        if life.due_to_die() and self.segmenter.seconds_since_last_voice() > 4:
+            self._life_busy = True
+            self._spawn(self._die())
+        elif life.dream_pending and self.segmenter.seconds_since_last_voice() > 120:
+            self._life_busy = True  # в войсе тихо пару минут — задремал
+            self._spawn(self._dream())
+
+    async def _dream(self) -> None:
+        try:
+            life = get_life()
+            life.dream_pending = False
+            life.save()
+            await dream(self.judge.llm)
+        finally:
+            self._life_busy = False
+
+    async def _die(self) -> None:
+        """Срок жизни вышел: последние слова, итог жизни, память — на кладбище. Следующий /join — новый."""
+        log.info("срок жизни вышел — умираю")
+        said_before = len(self._my_lines)
+        try:
+            await asyncio.wait_for(self._speak_stream(
+                self.responder.stream_task(self.buffer.render(self.buffer.recent(20)),
+                                           getattr(persona, "DEATH_TASK", persona.FAREWELL_TASK), max_tokens=120),
+                proactive=False), timeout=30)
+        except Exception:
+            log.exception("не смог сказать последние слова")
+        last_words = self._my_lines[-1] if len(self._my_lines) > said_before else ""
+        try:
+            await asyncio.wait_for(asyncio.gather(
+                self.judge.maybe_update(self.buffer, force=True),
+                self.self_model.maybe_reflect(self.buffer, force=True)), timeout=20)
+        except Exception:
+            pass
+        epitaph = await write_epitaph(self.judge.llm)
+        grave = bury(epitaph, last_words)
+        self.dead = True
+        try:
+            await self.vc.channel.send(
+                f"🕯️ **{persona.BOT_NAME} умер.**\nПоследние слова: {last_words or '—'}\n\n{epitaph}\n\n"
+                f"Его память — в `data/кладбище/{grave.name}`. Следующий `/join` — новое рождение."[:1990])
+        except Exception:
+            log.warning("не смог написать о смерти в чат канала")
+        for t in list(self._tasks):
+            if t is not asyncio.current_task():
+                t.cancel()
+        if self.vc.is_listening():
+            self.vc.stop_listening()
+        self.player.stop()
+        await self.vc.disconnect()
+        if self.on_closed:
+            self.on_closed()
 
     def _note_clarity(self, unclear: bool) -> None:
         """Если за последнюю минуту большинство фраз — каша, бот говорит, что ничего не понимает (не чаще раза в 5 мин)."""

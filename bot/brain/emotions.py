@@ -128,7 +128,7 @@ _EMOTIONS: Emotions | None = None
 def get_emotions() -> Emotions:
     global _EMOTIONS
     if _EMOTIONS is None:
-        from bot import persona
+        from bot.brain.life import memory_id
 
-        _EMOTIONS = Emotions(Path(f"data/emotions_{persona.MEMORY_ID}.json"))
+        _EMOTIONS = Emotions(Path(f"data/emotions_{memory_id()}.json"))
     return _EMOTIONS

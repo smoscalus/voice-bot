@@ -8,6 +8,7 @@ from discord import app_commands
 from discord.ext import commands, voice_recv
 from openai import AsyncOpenAI
 
+from bot.brain.life import get_life, heartbeat
 from bot.brain.ollama import ensure_ollama
 from bot.config import PROVIDERS, Settings, has_groq_key, load_settings
 from bot import persona
@@ -86,6 +87,11 @@ class VoiceBot(commands.Bot):
             self.sfx = SoundBank(self.tts, voice_key)
             await self.sfx.load()
         await self._warmup_llm()
+        get_life()  # проснулся: заметит провал, если его выключали
+        from bot.brain.embed import get_embedder
+
+        get_embedder()  # поиск по смыслу грузится в фоне (первый раз скачивается ~120 МБ)
+        asyncio.create_task(heartbeat())
         register_commands(self)
         synced = await self.tree.sync()
         log.info("slash commands synced: %s", [c.name for c in synced])
@@ -124,6 +130,7 @@ def register_commands(bot: VoiceBot) -> None:
             await bot.sessions.pop(ctx.guild.id).stop()
         vc = await member.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
         session = VoiceSession(vc, bot.settings, bot.openai, bot.stt, bot.tts, bot.sfx)
+        session.on_closed = lambda gid=ctx.guild.id, ss=session: bot.sessions.get(gid) is ss and bot.sessions.pop(gid)
         session.start()
         bot.sessions[ctx.guild.id] = session
         await ctx.reply(f"Зашёл в **{member.voice.channel.name}** 🙂")
@@ -147,6 +154,7 @@ def register_commands(bot: VoiceBot) -> None:
             await bot.sessions.pop(guild_id).stop()
         vc = await member.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
         session = VoiceSession(vc, bot.settings, bot.openai, bot.stt, bot.tts, bot.sfx)
+        session.on_closed = lambda gid=guild_id, ss=session: bot.sessions.get(gid) is ss and bot.sessions.pop(gid)
         session.start()
         bot.sessions[guild_id] = session
         await interaction.followup.send(f"Зашёл в **{member.voice.channel.name}**. Зовите меня по имени 🙂")
@@ -160,6 +168,18 @@ def register_commands(bot: VoiceBot) -> None:
         await interaction.response.defer()
         await session.stop(farewell=True)
         await interaction.followup.send("Пока!")
+
+    @bot.tree.command(name="life", description="Как поживает бот: возраст, сколько знает, сколько осталось")
+    async def life(interaction: discord.Interaction):
+        from bot.brain.emotions import get_emotions
+        from bot.brain.knowledge import get_knowledge
+        from bot.brain.life import generation
+
+        k = get_knowledge()
+        await interaction.response.send_message(
+            f"**{persona.BOT_NAME}**, жизнь №{generation()}: {get_life().status()}.\n"
+            f"Знает {len(k.active)} вещей (всего узнал {k.learned_total}), возраст по знаниям: {k.stage()[0]}.\n"
+            f"Чувства: {get_emotions().describe()}.")
 
     @bot.tree.command(name="brain", description="Переключить мозги бота: local (Ollama на компе) или groq (облако)")
     @app_commands.describe(provider="local — без лимитов, на этом компе; groq — умнее и быстрее, но с лимитами")

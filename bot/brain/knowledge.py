@@ -2,15 +2,19 @@
 
 Бот «рождается» чистым листом: умеет говорить, но о мире знает лишь то, что записано здесь
 («дота — это игра, в неё играют впятером, — рассказал Вася»). Факты приносит летописец памяти
-(RelationsJudge) в фоне. Когда фактов становится слишком много — модель сама сжимает их,
-объединяя похожие и выкидывая мелочи. По объёму знаний считается «возраст» бота: чем больше
-он узнал, тем взрослее рассуждает.
+(RelationsJudge) в фоне. По объёму узнанного считается «возраст»: чем больше знает, тем взрослее.
+
+Память без потолка, но в каждый ответ идёт немного: самое свежее + то, что подходит к разговору
+(поиск по смыслу, bot/brain/embed.py). Как у человека:
+- воспоминание, которое всплывало в разговоре, во сне крепнет;
+- то, что не всплывало, во сне понемногу тускнеет (очень аккуратно): сначала «смутно помню»,
+  совсем бледное — уходит в архив и в ответы не попадает;
+- если забытое расскажут снова — он вспоминает («о, мне это уже говорили»).
 
 Хранится в data/world_<имя памяти>.json — можно открыть и посмотреть, что он знает о мире.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -18,14 +22,25 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import numpy as np
+
 log = logging.getLogger(__name__)
+
+SHOW_RECENT = 8          # свежие факты — всегда в ответе
+SHOW_RELEVANT = 12       # и столько подходящих к разговору
+RECALL_MIN_SCORE = 0.45  # насколько факт должен подходить, чтобы считалось «вспомнил»
+RECALL_COOLDOWN_S = 1800
+
+FADE_STEP = 0.07         # столько силы теряет за один сон то, что не вспоминалось
+IMPORTANT_FADE = 0.5     # важное (сильно задело) тускнеет вдвое медленнее
+RECALL_BOOST = 0.1       # вспоминалось — крепнет
+MAX_STRENGTH = 1.5
+VAGUE_BELOW = 0.65       # слабее — «смутно помню»
+ARCHIVE_BELOW = 0.3      # слабее — забыл (в архив)
 
 # «слово X не имеет ясного значения» — это не знание, а непонятое (обычно криво распознанная речь)
 _JUNK = re.compile(r"ясного значения|неясн|непонятн|не имеет значения|не имеют значения|неразборчив", re.I)
-
-MAX_FACTS = 150      # больше — сжимаем
-COMPRESS_TO = 90
-SHOW_IN_PROMPT = 45  # столько свежих/важных фактов видит модель в каждом ответе
+_WORD = re.compile(r"[а-яёa-z0-9]{4,}", re.I)
 
 # этапы взросления: (сколько фактов нужно, как он себя ведёт)
 STAGES = [
@@ -45,22 +60,34 @@ STAGES = [
 @dataclass
 class Fact:
     text: str
-    source: str = ""   # кто рассказал
-    ts: float = 0.0
+    source: str = ""        # кто рассказал
+    ts: float = 0.0         # когда (по календарю)
+    lived: float = 0.0      # когда (по его ощущению — сколько он тогда прожил)
+    strength: float = 1.0
+    important: bool = False
+    archived: bool = False
+    last_recall: float = 0.0
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:5] for w in _WORD.findall(text.lower().replace("ё", "е"))}
 
 
 class Knowledge:
     def __init__(self, path: Path):
         self.path = path
         self.facts: list[Fact] = []
-        self.learned_total = 0   # сколько всего узнал за жизнь (не уменьшается при сжатии) — для «возраста»
-        self._compressing = asyncio.Lock()
+        self.learned_total = 0   # сколько всего узнал за жизнь — для «возраста»
+        self.revived: list[str] = []   # только что вспомнил забытое — скажем ему один раз
+        self._vec: dict[str, np.ndarray] = {}
+        self._dirty = False
         self._load()
 
     def _load(self) -> None:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self.facts = [Fact(**f) for f in raw.get("facts", [])]
+            known = Fact.__dataclass_fields__
+            self.facts = [Fact(**{k: v for k, v in f.items() if k in known}) for f in raw.get("facts", [])]
             self.learned_total = int(raw.get("learned_total", len(self.facts)))
         except FileNotFoundError:
             pass
@@ -73,26 +100,105 @@ class Knowledge:
         data = {"learned_total": self.learned_total, "facts": [asdict(f) for f in self.facts]}
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.path)
+        self._dirty = False
 
-    def add(self, items: list[tuple[str, str]]) -> int:
-        """items: (факт, кто рассказал). Повторы и почти-повторы не добавляем. Возвращает, сколько нового."""
+    def save_if_dirty(self) -> None:
+        if self._dirty:
+            self.save()
+
+    @property
+    def active(self) -> list[Fact]:
+        return [f for f in self.facts if not f.archived]
+
+    def add(self, items: list[tuple[str, str, bool]]) -> int:
+        """items: (факт, кто рассказал, важно ли). Повторы не добавляем; забытое — вспоминаем."""
         from rapidfuzz import fuzz
 
+        from bot.brain.life import get_life
+
+        lived = get_life().lived_s
         added = 0
-        for text, source in items:
+        for text, source, important in items:
             text = text.strip()[:200]
             if len(text) < 4 or _JUNK.search(text):
                 continue
-            if any(fuzz.token_set_ratio(text.lower(), f.text.lower()) >= 85 for f in self.facts):
+            same = next((f for f in self.facts if fuzz.token_set_ratio(text.lower(), f.text.lower()) >= 85), None)
+            if same is not None:
+                if same.archived or same.strength < VAGUE_BELOW:  # рассказали забытое — вспомнил
+                    same.archived, same.strength = False, 1.0
+                    self.revived.append(same.text)
+                    log.info("вспомнил забытое: %s", same.text)
+                    self._dirty = True
                 continue
-            self.facts.append(Fact(text=text, source=source.strip()[:40], ts=time.time()))
+            self.facts.append(Fact(text=text, source=source.strip()[:40], ts=time.time(), lived=lived,
+                                   important=bool(important)))
             added += 1
         if added:
             self.learned_total += added
+        if added or self._dirty:
             self.save()
         return added
 
-    # ---------------------------------------------------------------- возраст
+    # ---------------------------------------------------------------- сон: тускнение
+    def fade(self, steps: int, since: float) -> int:
+        """Раз в сон: то, что вспоминалось после `since`, крепнет; остальное понемногу тускнеет."""
+        faded = 0
+        for _ in range(max(0, steps)):
+            for f in self.active:
+                if f.last_recall > since:
+                    f.strength = min(MAX_STRENGTH, f.strength + RECALL_BOOST)
+                else:
+                    f.strength -= FADE_STEP * (IMPORTANT_FADE if f.important else 1.0)
+                    faded += 1
+                    if f.strength < ARCHIVE_BELOW:
+                        f.archived = True
+                        log.info("забыл: %s", f.text)
+            since = time.time()  # следующие шаги того же сна — уже без «недавних воспоминаний»
+        self.save()
+        return faded
+
+    # ---------------------------------------------------------------- поиск по памяти
+    def _vectors(self, facts: list[Fact]):
+        from bot.brain.embed import get_embedder
+
+        emb = get_embedder()
+        if not emb.ready:
+            return None
+        missing = [f.text for f in facts if f.text not in self._vec]
+        if missing:
+            vs = emb.encode(missing)
+            if vs is None:
+                return None
+            self._vec.update(zip(missing, vs))
+        return np.stack([self._vec[f.text] for f in facts])
+
+    def relevant(self, query: str, pool: list[Fact], n: int) -> list[Fact]:
+        if not pool or not query.strip():
+            return []
+        q_stems = _stems(query)
+        words = np.array([min(0.5, 0.25 * len(q_stems & _stems(f.text))) for f in pool])
+        score = words
+        vecs = self._vectors(pool)
+        if vecs is not None:
+            from bot.brain.embed import get_embedder
+
+            q = get_embedder().encode([query])
+            if q is not None:
+                score = vecs @ q[0] + words
+        order = np.argsort(-score)[:n]
+        now = time.time()
+        picked = []
+        for i in order:
+            if score[i] <= 0.05:
+                break
+            f = pool[i]
+            picked.append(f)
+            if score[i] >= RECALL_MIN_SCORE and now - f.last_recall > RECALL_COOLDOWN_S:
+                f.last_recall = now   # к месту всплыло — это воспоминание окрепнет во сне
+                self._dirty = True
+        return picked
+
+    # ---------------------------------------------------------------- возраст и промпт
     def stage(self) -> tuple[str, str]:
         name, behaviour = STAGES[0][1], STAGES[0][2]
         for need, n, b in STAGES:
@@ -100,43 +206,43 @@ class Knowledge:
                 name, behaviour = n, b
         return name, behaviour
 
-    def prompt_block(self) -> str:
+    def _line(self, f: Fact, now_lived: float) -> str:
+        from bot.brain.life import ago
+
+        bits = [b for b in (f"рассказал {f.source}" if f.source else "", ago(now_lived - f.lived) if f.lived else "",
+                            "смутно помнишь" if f.strength < VAGUE_BELOW else "") if b]
+        return f"- {f.text}" + (f" ({', '.join(bits)})" if bits else "")
+
+    def prompt_block(self, query: str = "") -> str:
+        from bot.brain.life import get_life
+
         name, behaviour = self.stage()
         head = (f"Твой возраст по знаниям: {name} (узнал {self.learned_total} вещей). Сейчас {behaviour}.\n"
-                "ТЫ ЗНАЕШЬ О МИРЕ ТОЛЬКО ЭТО (узнал от людей). Всего остального ты не знаешь:")
-        if not self.facts:
+                "ТЫ ЗНАЕШЬ О МИРЕ ТОЛЬКО ЭТО (узнал от людей). Всего остального ты не знаешь. "
+                "Что помнишь смутно — говори неуверенно («кажется, мне говорили…»):")
+        active = self.active
+        if not active:
             return head + "\n- пока ничего"
-        shown = self.facts[-SHOW_IN_PROMPT:]
-        lines = [f"- {f.text}" + (f" (рассказал {f.source})" if f.source else "") for f in shown]
-        return head + "\n" + "\n".join(lines)
+        now_lived = get_life().lived_s
+        recent = sorted(active, key=lambda f: f.ts)[-SHOW_RECENT:]
+        rest = [f for f in active if f not in recent]
+        rel = self.relevant(query, rest, SHOW_RELEVANT)
+        parts = [head, "Недавно узнал:", *[self._line(f, now_lived) for f in recent]]
+        if rel:
+            parts += ["Вспоминается к разговору:", *[self._line(f, now_lived) for f in rel]]
+        if self.revived:
+            parts.append("Ты только что вспомнил давно забытое (тебе это уже рассказывали!): "
+                         + "; ".join(self.revived[-3:]))
+            self.revived.clear()
+        return "\n".join(parts)
 
-    # ---------------------------------------------------------------- сжатие
-    async def maybe_compress(self, llm) -> None:
-        """Когда фактов много — модель объединяет похожие и выкидывает мелочи (как память у человека)."""
-        if len(self.facts) <= MAX_FACTS or self._compressing.locked():
-            return
-        async with self._compressing:
-            listing = "\n".join(f"- {f.text} | {f.source}" for f in self.facts)
-            prompt = (f"Это знания о мире, которые бот узнал от людей (факт | кто рассказал). Сожми до {COMPRESS_TO} "
-                      "пунктов: объедини похожие, выкинь мелочи и устаревшее, сохрани самое важное и интересное. "
-                      "Ничего не добавляй от себя. Ответь строго JSON: "
-                      '{"facts": [{"text": "факт", "source": "кто рассказал"}]}')
-            try:
-                resp = await llm.create(
-                    messages=[{"role": "system", "content": prompt}, {"role": "user", "content": listing}],
-                    response_format={"type": "json_object"},
-                    max_completion_tokens=3000,
-                )
-                new = json.loads(resp.choices[0].message.content or "{}").get("facts", [])
-            except Exception as e:
-                log.warning("не смог сжать знания: %s", e)
-                return
-            facts = [Fact(text=str(f.get("text", ""))[:200], source=str(f.get("source", ""))[:40], ts=time.time())
-                     for f in new if isinstance(f, dict) and str(f.get("text", "")).strip()]
-            if len(facts) >= COMPRESS_TO // 3:  # защита от «модель вернула пустоту»
-                log.info("знания о мире сжаты: %d → %d", len(self.facts), len(facts))
-                self.facts = facts
-                self.save()
+    def vivid_block(self, n: int = 15) -> str:
+        """Самое яркое — для снов и итога жизни: крепкие, важные и свежие воспоминания."""
+        active = self.active
+        if not active:
+            return "Воспоминаний о мире пока нет."
+        best = sorted(active, key=lambda f: (f.important, f.strength, f.ts), reverse=True)[:n]
+        return "Яркие воспоминания:\n" + "\n".join(f"- {f.text}" for f in best)
 
 
 _KNOWLEDGE: Knowledge | None = None
@@ -145,7 +251,7 @@ _KNOWLEDGE: Knowledge | None = None
 def get_knowledge() -> Knowledge:
     global _KNOWLEDGE
     if _KNOWLEDGE is None:
-        from bot import persona
+        from bot.brain.life import memory_id
 
-        _KNOWLEDGE = Knowledge(Path(f"data/world_{persona.MEMORY_ID}.json"))
+        _KNOWLEDGE = Knowledge(Path(f"data/world_{memory_id()}.json"))
     return _KNOWLEDGE

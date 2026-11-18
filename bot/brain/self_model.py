@@ -50,6 +50,7 @@ class SelfState:
     tasks: list[str] = field(default_factory=list)
     fears: list[str] = field(default_factory=list)
     mood: str = ""
+    dreams: list[str] = field(default_factory=list)   # последние сны (пишет bot/brain/life.py)
     updated: float = 0.0
 
 
@@ -99,10 +100,19 @@ class SelfModel:
                 parts.append(f"{title}: " + "; ".join(items))
         if s.mood:
             parts.append("настроение: " + s.mood)
+        if s.dreams:
+            parts.append("последний сон: " + s.dreams[-1])
         if not parts:
             return ""
         return ("Ты о себе (это твоё, упоминай к месту, не вываливай всё сразу; цели — то, чем ты сейчас "
                 "занят):\n- " + "\n- ".join(parts))
+
+    def add_dream(self, text: str) -> None:
+        self.state.dreams = (self.state.dreams + [text.strip()[:400]])[-5:]
+        self.save()
+
+    def dreams_block(self) -> str:
+        return ("Сны:\n- " + "\n- ".join(self.state.dreams)) if self.state.dreams else ""
 
     async def maybe_reflect(self, buffer, force: bool = False) -> None:
         if self._lock.locked() or (not force and time.monotonic() - self._last_run < self.MIN_INTERVAL_S):
@@ -113,7 +123,8 @@ class SelfModel:
                 return
             self._last_run = time.monotonic()
             self._last_seq = buffer.last_seq
-            current = json.dumps({k: v for k, v in asdict(self.state).items() if k != "updated"}, ensure_ascii=False)
+            current = json.dumps({k: v for k, v in asdict(self.state).items() if k not in ("updated", "dreams")},
+                                 ensure_ascii=False)
             from bot.brain.emotions import get_emotions
 
             user = (f"Текущее самоописание:\n{current}\n\nЕго ощущения сейчас: {get_emotions().describe()}"
@@ -153,7 +164,7 @@ _SELF: SelfModel | None = None
 def get_self_model(llm: LLMRouter) -> SelfModel:
     global _SELF
     if _SELF is None:
-        from bot import persona
+        from bot.brain.life import memory_id
 
-        _SELF = SelfModel(Path(f"data/self_{persona.MEMORY_ID}.json"), llm)
+        _SELF = SelfModel(Path(f"data/self_{memory_id()}.json"), llm)
     return _SELF
