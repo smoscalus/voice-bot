@@ -57,13 +57,13 @@
 ## Без Docker
 
 Нужен Python 3.11–3.12. Windows: `setup.bat`, затем `copy .env.example .env`, заполнить, `run.bat`.
-Для режима local дополнительно поставь [Ollama](https://ollama.com) и запусти её.
+Для режима local дополнительно поставь [Ollama](https://ollama.com) и запусти её с `OLLAMA_CONTEXT_LENGTH=8192` (иначе память бота не влезает в её окно).
 
 ## Настройка
 
 - Характер, имя, цель, когда влезать в разговор — [`bot/persona.py`](bot/persona.py); прежний персонаж (тролль-провокатор) — `bot/persona_troll.py`
 - Голос, модели, частота вмешательств, порог перебивания — `.env` (все параметры описаны в `.env.example`)
-- Память о людях — `data/relations_<имя>.json`, о мире — `data/world_<имя>.json`, о себе — `data/self_<имя>.json` (обычный JSON, можно читать и править)
+- Память о людях — `data/relations_<имя>.json`, о мире — `data/world_<имя>.json`, о себе — `data/self_<имя>.json`, чувства — `data/emotions_<имя>.json` (обычный JSON, можно читать и править)
 
 ## Как устроено
 

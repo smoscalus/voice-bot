@@ -147,6 +147,11 @@ if ($provider -eq "local") {
     if ($hostOllama) {
         Say "Нашёл Ollama на этом компьютере — использую её." "Green"
         Set-EnvValue "DOCKER_OLLAMA_URL" "http://host.docker.internal:11434"
+        # память бота + характер + разговор не влезают в стандартное окно Ollama (4096) — просим 8192
+        if (-not [Environment]::GetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "User")) {
+            [Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "8192", "User")
+            Say "Увеличил Ollama окно памяти до 8192. ПЕРЕЗАПУСТИ Ollama (значок у часов → Quit, и открыть снова)." "Yellow"
+        }
     } else {
         Set-EnvValue "DOCKER_OLLAMA_URL" "http://ollama:11434"
         $composeArgs += @("-f", "docker-compose.yml")

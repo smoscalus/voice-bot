@@ -13,11 +13,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+# «слово X не имеет ясного значения» — это не знание, а непонятое (обычно криво распознанная речь)
+_JUNK = re.compile(r"ясного значения|неясн|непонятн|не имеет значения|не имеют значения|неразборчив", re.I)
 
 MAX_FACTS = 150      # больше — сжимаем
 COMPRESS_TO = 90
@@ -77,7 +81,7 @@ class Knowledge:
         added = 0
         for text, source in items:
             text = text.strip()[:200]
-            if len(text) < 4:
+            if len(text) < 4 or _JUNK.search(text):
                 continue
             if any(fuzz.token_set_ratio(text.lower(), f.text.lower()) >= 85 for f in self.facts):
                 continue

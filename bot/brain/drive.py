@@ -37,10 +37,10 @@ class Drive:
         self._tick()
         self.level = max(0.0, self.level - PER_OWN_SPEECH)
 
-    def wants_to_speak(self) -> bool:
-        """Достаточно ли любопытно, чтобы самому встревать."""
+    def wants_to_speak(self, bias: float = 0.0) -> bool:
+        """Достаточно ли любопытно, чтобы самому встревать. bias — поправка от чувств (страх −, радость +)."""
         self._tick()
-        return self.level >= 0.35
+        return self.level + bias >= 0.35
 
     def prompt_block(self) -> str:
         self._tick()

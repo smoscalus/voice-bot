@@ -26,6 +26,8 @@ services:
   ollama:
     image: ollama/ollama:latest
     profiles: ["local"]
+    environment:
+      OLLAMA_CONTEXT_LENGTH: "8192"   # память + характер + разговор не влезают в стандартные 4096
     volumes:
       - ollama:/root/.ollama
     restart: unless-stopped

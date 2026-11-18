@@ -28,6 +28,7 @@ from bot.audio.receiver import SegmentingSink
 from bot.audio.segmenter import Utterance, UtteranceSegmenter
 from bot.brain.interest import InterestClassifier
 from bot.brain.drive import get_drive
+from bot.brain.emotions import get_emotions
 from bot.brain.knowledge import get_knowledge
 from bot.brain.llm import LLMRouter
 from bot.brain.relations import RelationsJudge, get_store
@@ -168,7 +169,8 @@ class VoiceSession:
         """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
         blocks = [get_knowledge().prompt_block(), self.self_model.prompt_block(),
-                  self.relations.prompt_block(participants), self.drive.prompt_block(), self._my_lines_block()]
+                  self.relations.prompt_block(participants), self.drive.prompt_block(),
+                  get_emotions().prompt_block(), self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
     def _my_lines_block(self) -> str:
@@ -359,7 +361,7 @@ class VoiceSession:
                 or now - self.policy.last_spoke < 60
                 or self.segmenter.seconds_since_last_voice() < OWN_LULL_S
                 or time.time() - last_human > 600          # в канале давно тишина — говорить не с кем
-                or self.drive.level < OWN_MIN_CURIOSITY
+                or self.drive.level + get_emotions().talk_bias() < OWN_MIN_CURIOSITY
                 or random.random() > OWN_CHANCE):
             return
         self._last_own_initiative = now
@@ -454,7 +456,7 @@ class VoiceSession:
             log.debug("skip evaluation: %s", why or "proactive disabled")
             self.policy.reset_interest()
             return
-        if not follow_up and not self._returning and not self.drive.wants_to_speak():
+        if not follow_up and not self._returning and not self.drive.wants_to_speak(get_emotions().talk_bias()):
             # сейчас не любопытно — сам не лезет и не тратит лимит на «а не влезть ли»
             self.policy.reset_interest()
             return

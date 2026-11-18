@@ -106,6 +106,7 @@ args=(compose)
 if [ "$provider" = "local" ]; then
   if curl -fs -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 || curl -fs -m 2 http://localhost:11434/api/tags >/dev/null 2>&1 || pgrep -x ollama >/dev/null 2>&1; then
     say "Нашёл Ollama на этом компьютере — использую её."
+    [ -n "${OLLAMA_CONTEXT_LENGTH:-}" ] || say "Совет: запусти Ollama с OLLAMA_CONTEXT_LENGTH=8192 — иначе память бота не влезет в её окно."
     set_env DOCKER_OLLAMA_URL "http://host.docker.internal:11434"
   else
     set_env DOCKER_OLLAMA_URL "http://ollama:11434"

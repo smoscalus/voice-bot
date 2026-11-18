@@ -28,6 +28,8 @@ REFLECT_PROMPT = """Ты — внутренний голос бота {name} и�
 Тебе дают его текущее самоописание и свежий разговор. Обнови самоописание ОТ ПЕРВОГО ЛИЦА («я…»), по-русски:
 {sections}
 - mood — настроение, 1–3 слова.
+Тебе дают и его ощущения (уровни, как гормоны). Что это за чувство и почему оно — решай сам, по разговору
+(«мне тревожно, потому что Х грозился меня выключить»), и учитывай в настроении и разделах.
 Каждый пункт до 14 слов. Меняй постепенно, сохраняй важное, ничего не выдумывай из воздуха — выводы только
 из того, что реально было в разговорах. ПУСТЫЕ разделы обязательно заполни (хотя бы 1–2 пункта) по разговору.
 null — только для непустого раздела, в котором нечего менять. Изменился — верни раздел целиком.
@@ -112,7 +114,10 @@ class SelfModel:
             self._last_run = time.monotonic()
             self._last_seq = buffer.last_seq
             current = json.dumps({k: v for k, v in asdict(self.state).items() if k != "updated"}, ensure_ascii=False)
-            user = f"Текущее самоописание:\n{current}\n\nСвежий разговор:\n{buffer.render(new[-30:])}"
+            from bot.brain.emotions import get_emotions
+
+            user = (f"Текущее самоописание:\n{current}\n\nЕго ощущения сейчас: {get_emotions().describe()}"
+                    f"\n\nСвежий разговор:\n{buffer.render(new[-30:])}")
             try:
                 resp = await self.llm.create(
                     messages=[{"role": "system", "content": self.system}, {"role": "user", "content": user}],
