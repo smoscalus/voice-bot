@@ -41,6 +41,18 @@ ARCHIVE_BELOW = 0.3      # слабее — забыл (в архив)
 # «слово X не имеет ясного значения» — это не знание, а непонятое (обычно криво распознанная речь)
 _JUNK = re.compile(r"ясного значения|неясн|непонятн|не имеет значения|не имеют значения|неразборчив", re.I)
 _WORD = re.compile(r"[а-яёa-z0-9]{4,}", re.I)
+# записи о самом боте («Петрык понял, что…») — это его дневник, а не знание о мире
+_ABOUT_SELF = re.compile(r"^(петр[ыи]к|бот)\b.{0,40}\b(понял|узнал|не понимает|пытается|чувствует|не уверен|"
+                         r"задумал|хочет|боится|запомнил)", re.I)
+
+
+def _is_junk(text: str, source: str, bot: str) -> bool:
+    t = text.lower()
+    return (len(t.split()) < 4                                 # обрывок: «Вилле назвал Петрыка»
+            or t.rstrip(" .").endswith((" что", ",", " и", " но"))  # оборвалось: «Петрык узнал, что»
+            or bool(_JUNK.search(t)) or bool(_ABOUT_SELF.search(t))
+            or bot in source.lower() or "(бот)" in source.lower()   # сам себе рассказал — не знание
+            or not source.strip())
 
 # этапы взросления: (сколько фактов нужно, как он себя ведёт)
 STAGES = [
@@ -79,6 +91,8 @@ class Knowledge:
         self.facts: list[Fact] = []
         self.learned_total = 0   # сколько всего узнал за жизнь — для «возраста»
         self.revived: list[str] = []   # только что вспомнил забытое — скажем ему один раз
+        self.curious: list[dict] = []  # о чём спрашивал и не знает: {term, ts, tried} — прочитает в книжке
+        self.reads: list[float] = []   # когда читал книжку (лимит в сутки)
         self._vec: dict[str, np.ndarray] = {}
         self._dirty = False
         self._load()
@@ -89,6 +103,16 @@ class Knowledge:
             known = Fact.__dataclass_fields__
             self.facts = [Fact(**{k: v for k, v in f.items() if k in known}) for f in raw.get("facts", [])]
             self.learned_total = int(raw.get("learned_total", len(self.facts)))
+            self.curious = [c for c in raw.get("curious", []) if isinstance(c, dict) and c.get("term")]
+            self.reads = [float(t) for t in raw.get("reads", [])][-50:]
+            from bot import persona
+
+            junk = [f for f in self.active if _is_junk(f.text, f.source, persona.BOT_NAME.lower())]
+            for f in junk:  # мусор прошлых версий (обрывки, записи о себе) — в архив, не удаляем
+                f.archived = True
+            if junk:
+                log.info("убрал в архив мусор из знаний: %d", len(junk))
+                self._dirty = True
         except FileNotFoundError:
             pass
         except Exception:
@@ -97,7 +121,8 @@ class Knowledge:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        data = {"learned_total": self.learned_total, "facts": [asdict(f) for f in self.facts]}
+        data = {"learned_total": self.learned_total, "facts": [asdict(f) for f in self.facts],
+                "curious": self.curious[-40:], "reads": self.reads[-50:]}
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.path)
         self._dirty = False
@@ -118,9 +143,12 @@ class Knowledge:
 
         lived = get_life().lived_s
         added = 0
+        from bot import persona
+
+        bot = persona.BOT_NAME.lower()
         for text, source, important in items:
             text = text.strip()[:200]
-            if len(text) < 4 or _JUNK.search(text):
+            if _is_junk(text, source, bot):
                 continue
             same = next((f for f in self.facts if fuzz.token_set_ratio(text.lower(), f.text.lower()) >= 85), None)
             if same is not None:
@@ -138,6 +166,32 @@ class Knowledge:
         if added or self._dirty:
             self.save()
         return added
+
+    # ---------------------------------------------------------------- любопытство для книжки
+    def knows(self, term: str) -> bool:
+        stems = _stems(term)
+        return bool(stems) and any(stems <= _stems(f.text) for f in self.active)
+
+    def add_curious(self, term: str) -> None:
+        low = term.lower()
+        if self.knows(term) or any(c["term"].lower() == low for c in self.curious):
+            return
+        self.curious.append({"term": term, "ts": time.time(), "tried": False})
+        self.curious = self.curious[-40:]
+        self._dirty = True
+        log.info("хочу узнать: %s", term)
+
+    def next_curious(self, wait_s: float) -> dict | None:
+        now = time.time()
+        for c in self.curious:
+            if c.get("tried") or now - c.get("ts", now) < wait_s:
+                continue
+            if self.knows(c["term"]):  # пока ждал — ему объяснили
+                c["tried"] = True
+                self._dirty = True
+                continue
+            return c
+        return None
 
     # ---------------------------------------------------------------- сон: тускнение
     def fade(self, steps: int, since: float) -> int:
@@ -209,7 +263,8 @@ class Knowledge:
     def _line(self, f: Fact, now_lived: float) -> str:
         from bot.brain.life import ago
 
-        bits = [b for b in (f"рассказал {f.source}" if f.source else "", ago(now_lived - f.lived) if f.lived else "",
+        who = "прочитал сам в книжке" if f.source == "книжка" else f"рассказал {f.source}" if f.source else ""
+        bits = [b for b in (who, ago(now_lived - f.lived) if f.lived else "",
                             "смутно помнишь" if f.strength < VAGUE_BELOW else "") if b]
         return f"- {f.text}" + (f" ({', '.join(bits)})" if bits else "")
 

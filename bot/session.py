@@ -31,6 +31,7 @@ from bot.brain.drive import get_drive
 from bot.brain.emotions import get_emotions
 from bot.brain.knowledge import get_knowledge
 from bot.brain.life import bury, dream, get_life, write_epitaph
+from bot.brain import book
 from bot.brain.llm import LLMRouter
 from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
@@ -404,6 +405,17 @@ class VoiceSession:
         elif life.dream_pending and self.segmenter.seconds_since_last_voice() > 120:
             self._life_busy = True  # в войсе тихо пару минут — задремал
             self._spawn(self._dream())
+        elif self.segmenter.seconds_since_last_voice() > 60 and book.due():
+            self._life_busy = True  # затишье, а ему так и не объяснили — читает сам
+            self._spawn(self._read_book())
+
+    async def _read_book(self) -> None:
+        try:
+            await book.read_one(self.judge.llm)
+        except Exception:
+            log.exception("книжка: ошибка")
+        finally:
+            self._life_busy = False
 
     async def _dream(self) -> None:
         try:
@@ -673,6 +685,7 @@ class VoiceSession:
                 line.text = text or "…"
                 if text and not cut:
                     self._my_lines.append(text)
+                    book.note_questions(text)  # о чём спросил — прочитает в книжке, если не ответят
                 if not text:
                     self.buffer.remove(line)  # ничего не сказала — пустую реплику в память не пишем
                 log.info("BOT (%s%s): %s", "proactive" if proactive else "direct",

@@ -19,7 +19,7 @@ import discord
 from bot.audio.convert import DISCORD_FRAME_BYTES, SILENCE_FRAME, Upsampler24kMonoTo48kStereo
 
 log = logging.getLogger(__name__)
-STALL_TIMEOUT_S = 25.0  # если TTS/LLM не прислали ни кусочка столько времени — считаем, что зависли
+STALL_TIMEOUT_S = 45.0  # если TTS/LLM не прислали ни кусочка столько времени — считаем, что зависли
 
 
 class StreamingPCMSource(discord.AudioSource):

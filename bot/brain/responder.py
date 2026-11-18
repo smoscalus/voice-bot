@@ -196,34 +196,44 @@ class Responder:
             # квота на вопросы: два ответа подряд были вопросами — хватит допрашивать
             task += ("\nВ ЭТОТ РАЗ НЕ ЗАДАВАЙ ВОПРОСОВ: ты и так допрашиваешь людей подряд. "
                      "Ответь утверждением — отреагируй, поделись мыслью, догадкой или тем, что понял.")
-        gen = self._generate_stream(transcript, task, max_tokens)
-        first = None
-        async for sentence in gen:
-            first = _tidy(sentence, greeted)
-            break
-        if first is not None and (same := find_repeat(first, recent)):
-            await gen.aclose()
-            log.info("повтор «%s» (уже говорил «%s») — придумываю заново", first, same)
-            task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{same}». НЕ повторяй это и не задавай этот вопрос снова "
-                    "(даже другими словами). Скажи что-то другое: ответь по сути, поделись мыслью, "
-                    "смени тему или просто помолчи об этом.")
+        # ремарки в скобках — редко: если в двух последних репликах уже была ремарка, в этой без неё
+        no_remarks = any(_REMARK.search(line) for line in recent[-2:])
+        heard_l = list(heard)
+
+        def prepare(sentence: str) -> tuple[str, str | None]:
+            s = _tidy(sentence, greeted)
+            if no_remarks:
+                s = re.sub(r"\s+([.,!?…])", r"\1", re.sub(r"\s{2,}", " ", _REMARK.sub("", s))).strip()
+            if not s:
+                return "", None
+            return s, find_repeat(s, recent) or find_parrot(s, heard_l)
+
+        # Повторную фразу просто выкидываем и продолжаем тот же ответ — без новой генерации (на локальной
+        # модели это ещё 10–20 с). Заново генерируем, только если от ответа совсем ничего не осталось.
+        for attempt in range(2):
             gen = self._generate_stream(transcript, task, max_tokens)
-            first = None
-        elif first is not None and (same := find_parrot(first, list(heard))):
-            await gen.aclose()
-            log.info("попугайничает «%s» (человек сказал «%s») — придумываю заново", first, same)
-            task = (f"{task}\nВНИМАНИЕ: не повторяй за человеком его же слова («{same}») — "
-                    "ответь своими словами по сути.")
-            gen = self._generate_stream(transcript, task, max_tokens)
-            first = None
-        if first:
-            yield first
-        async for sentence in gen:
-            sentence = _tidy(sentence, greeted)
-            if not sentence or find_repeat(sentence, recent) or find_parrot(sentence, list(heard)):
-                log.info("пропускаю повтор в ответе: «%s»", sentence)
-                continue
-            yield sentence
+            said_real, pending, bad = False, [], None
+            async for sentence in gen:
+                s, same = prepare(sentence)
+                if same:
+                    bad = bad or same
+                    log.info("пропускаю повтор в ответе: «%s» (уже было «%s»)", s, same)
+                    continue
+                if not s:
+                    continue
+                if not _REMARK.sub("", s).strip(" .,!?…"):
+                    pending.append(s)  # одна ремарка без слов — скажем, только если за ней будут слова
+                    continue
+                for r in pending:
+                    yield r
+                pending.clear()
+                said_real = True
+                yield s
+            if said_real or bad is None:
+                return
+            log.info("весь ответ — повтор «%s», придумываю заново", bad)
+            task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{bad}». НЕ повторяй это и не задавай этот вопрос снова "
+                    "(даже другими словами), не повторяй за людьми их слова. Скажи что-то другое по сути.")
 
     def _messages(self, transcript: str, task: str) -> list[dict]:
         system = self.system_prompt
