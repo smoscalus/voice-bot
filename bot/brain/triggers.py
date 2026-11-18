@@ -13,9 +13,15 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+_SECOND_PERSON = {"ты", "тебя", "тебе", "тобой", "твой", "твоя", "твое", "твои", "твоего", "вы", "скажи",
+                  "расскажи", "ответь", "слышишь", "знаешь", "думаешь", "хочешь", "можешь", "понял", "понимаешь"}
+_LEAD_WORDS = {"эй", "ну", "слушай", "а", "о", "так", "вот", "алло", "привет", "здарова", "здорово", "йо", "хей"}
+
+
 @dataclass
 class TriggerResult:
     wake: bool = False
+    vocative: bool = False       # имя звучит как обращение к нему («Петрык, …»), а не разговор о нём
     stop: bool = False
     remainder: str = ""          # текст без слова-обращения
     score: float = 0.0           # вклад в «интересность»
@@ -43,6 +49,27 @@ class TriggerDetector:
                 return True
         return False
 
+    def _is_vocative(self, text: str) -> bool:
+        """«Петрык, …», «…, Петрык?», «эй, Петрык» — к нему. «Петрык думает», «спроси Петрыка» — о нём."""
+        words = [(m.group(0), m.start(), m.end()) for m in re.finditer(r"[\w-]+", text.lower().replace("ё", "е"))]
+        if len(words) <= 2:
+            return True  # «Петрык, привет», «Петрык?» — коротко, значит к нему
+        toks = [w for w, _, _ in words]
+        if _SECOND_PERSON & set(toks):
+            return True  # «Петрык, ты…», «тебе», «твой» — говорят с ним
+        for i, (w, a, b) in enumerate(words):
+            if not self._is_wake_token(w):
+                continue
+            before = text[:a].rstrip()
+            after = text[b:].lstrip()
+            lead = all(t in _LEAD_WORDS for t in toks[:i])  # в начале (можно после «эй», «ну», «слушай»)
+            plain = not w.endswith(("ка", "ку", "ком", "ке", "ом", "ым", "ем"))  # «Петрика», «Петрику» — о нём
+            if lead or (i == len(words) - 1 and plain):
+                return True
+            if plain and after[:1] in (",", "!", "?", ":"):
+                return True  # «…, Петрык, …» — выделено запятыми, обращение
+        return False
+
     def analyze(self, text: str) -> TriggerResult:
         res = TriggerResult()
         norm = normalize(text)
@@ -64,6 +91,8 @@ class TriggerDetector:
             else:
                 kept.append(t)
         res.remainder = " ".join(kept)
+        if res.wake:
+            res.vocative = self._is_vocative(text)
 
         # --- префильтр интересности ---
         for topic, kws in self.topics.items():

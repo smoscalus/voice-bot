@@ -101,6 +101,11 @@ class VoiceSession:
         self._returning: set[str] = set()    # вернулись, и на них есть материал в памяти
         self.drive = get_drive()              # любопытство: растёт без нового, падает, когда узнал
         self.dead = False
+        self._mention: tuple[float, str] | None = None  # о нём говорили в третьем лице: (когда, фраза)
+        self._last_vocative = 0.0                       # когда к нему последний раз обращались
+        self._chat_proactive: deque[float] = deque(maxlen=10)  # встревал, пока люди болтали между собой
+        self._chatting_since: float | None = None
+        self._last_left_out = 0.0
         self.on_closed = None                 # main.py: убрать сессию из списка, когда он умер
         self._next_life_check = 0.0
         self._life_busy = False
@@ -177,9 +182,10 @@ class VoiceSession:
         """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
         query = " ".join(l.text for l in self.buffer.recent(6))  # о чём сейчас речь — что из памяти вспомнить
+        chat = "Сейчас люди разговаривают между собой, не с тобой." if self._people_chatting() else ""
         blocks = [get_life().prompt_block(), get_knowledge().prompt_block(query), self.self_model.prompt_block(),
                   self.relations.prompt_block(participants), self.drive.prompt_block(),
-                  get_emotions().prompt_block(), self._my_lines_block()]
+                  get_emotions().prompt_block(), chat, self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
     def _my_lines_block(self) -> str:
@@ -336,8 +342,16 @@ class VoiceSession:
             self.player.interrupt()
             return
 
-        # 1) прямое обращение
+        # 1) прямое обращение («Петрык, …»). Если о нём говорят в третьем лице («Петрык думает») —
+        #    это не обращение: решит внутренний голос, отозваться ли («эй, я всё слышу»)
+        if trig.wake and not trig.vocative:
+            self._mention = (time.monotonic(), text)
+            log.info("о нём говорят (не к нему): %s", text)
+            self.policy.add_interest(self.s.prefilter_threshold)
+            self._schedule_evaluation()
+            return
         if trig.wake:
+            self._last_vocative = time.monotonic()
             if not trig.remainder.strip():
                 # голое «Вася!» — ждём продолжения; не дождались — отвечаем на само обращение.
                 self.policy.open_attention(utt.user_id)
@@ -398,6 +412,7 @@ class VoiceSession:
         self._next_life_check = now + 5
         if self._reconnecting or self.player.is_playing or self._reply_busy():
             return
+        self._feel_left_out(now)
         life = get_life()
         if life.due_to_die() and self.segmenter.seconds_since_last_voice() > 4:
             self._life_busy = True
@@ -408,6 +423,27 @@ class VoiceSession:
         elif self.segmenter.seconds_since_last_voice() > 60 and book.due():
             self._life_busy = True  # затишье, а ему так и не объяснили — читает сам
             self._spawn(self._read_book())
+
+    def _people_chatting(self) -> bool:
+        """Люди говорят между собой: последние реплики — от разных людей, бот в них не участвует
+        и к нему давно не обращались."""
+        lines = [l for l in self.buffer.recent(6) if time.time() - (l.end_ts or l.ts) < 150]
+        if len(lines) < 4 or any(l.is_bot for l in lines[-4:]):
+            return False
+        if time.monotonic() - self._last_vocative < 60 or time.monotonic() - self.policy.last_spoke < 45:
+            return False
+        return len({l.speaker for l in lines if not l.is_bot}) >= 2
+
+    def _feel_left_out(self, now: float) -> None:
+        """Долго болтают без него — ему немного грустно и хочется потом спросить, о чём говорили."""
+        if not self._people_chatting():
+            self._chatting_since = None
+            return
+        self._chatting_since = self._chatting_since or now
+        if now - self._chatting_since > 180 and now - self._last_left_out > 600:
+            self._last_left_out = now
+            log.info("люди давно болтают без него — немного грустно")
+            get_emotions().apply({"sadness": 0.1, "joy": -0.05})
 
     async def _read_book(self) -> None:
         try:
@@ -552,6 +588,14 @@ class VoiceSession:
         self.policy.reset_interest()
         hint = f"Бот последний раз говорил {int(time.monotonic() - self.policy.last_spoke)} с назад." \
             if self.policy.last_spoke else "Бот ещё ничего не говорил."
+        chatting = self._people_chatting()
+        mention = self._mention if self._mention and time.monotonic() - self._mention[0] < 30 else None
+        if mention:
+            hint += (f"\nО боте только что сказали в третьем лице (не ему): «{mention[1]}». Это НЕ обращение "
+                     "(addressed_to_bot=false), но он может отозваться, если хочется.")
+        elif chatting:
+            hint += ("\nЛюди сейчас разговаривают МЕЖДУ СОБОЙ, не с ботом. Вклиниваться — только если тема "
+                     "его по-настоящему цепляет; иначе intervene=false.")
         if self._returning:
             hint += (f"\nТолько что впервые за сегодня появились в разговоре: {', '.join(sorted(self._returning))}. "
                      "У них в памяти есть планы/зацепки — хороший повод спросить, как успехи.")
@@ -567,7 +611,17 @@ class VoiceSession:
         if verdict.addressed_to_bot and last and not last[0].is_bot:
             self._request_reply(last[0].end_ts or last[0].ts)
             return
-        if verdict.intervene and verdict.confidence >= self.s.interest_confidence and can_pro and self.proactive_enabled:
+        now = time.monotonic()
+        need = self.s.interest_confidence
+        if chatting and not mention:  # болтают без него — встревает редко: уверенно и не больше 2 раз за 10 мин
+            need = max(need, 0.9)
+            if sum(1 for t in self._chat_proactive if now - t < 600) >= 2:
+                need = 2.0
+        if verdict.intervene and verdict.confidence < need:
+            log.info("не встреваю: люди болтают между собой (уверенность %.2f < %.2f)", verdict.confidence, need)
+        if verdict.intervene and verdict.confidence >= need and can_pro and self.proactive_enabled:
+            if chatting and not mention:
+                self._chat_proactive.append(now)
             # пока думали — кто-то заговорил? Не перебиваем.
             if self.segmenter.seconds_since_last_voice() < self.s.quiet_gap_s:
                 log.info("dropped proactive reply: room is not quiet")
