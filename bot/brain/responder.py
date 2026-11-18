@@ -195,7 +195,7 @@ class Responder:
         if len(recent) >= 2 and all("?" in line for line in recent[-2:]):
             # квота на вопросы: два ответа подряд были вопросами — хватит допрашивать
             task += ("\nВ ЭТОТ РАЗ НЕ ЗАДАВАЙ ВОПРОСОВ: ты и так допрашиваешь людей подряд. "
-                     "Ответь утверждением — подколи, отреагируй, выскажи мнение или бредовую мысль.")
+                     "Ответь утверждением — отреагируй, поделись мыслью, догадкой или тем, что понял.")
         gen = self._generate_stream(transcript, task, max_tokens)
         first = None
         async for sentence in gen:
@@ -205,8 +205,8 @@ class Responder:
             await gen.aclose()
             log.info("повтор «%s» (уже говорил «%s») — придумываю заново", first, same)
             task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{same}». НЕ повторяй это и не задавай этот вопрос снова "
-                    "(даже другими словами). Скажи что-то другое: ответь по сути, подколи за реакцию, "
-                    "смени тему или просто отстань.")
+                    "(даже другими словами). Скажи что-то другое: ответь по сути, поделись мыслью, "
+                    "смени тему или просто помолчи об этом.")
             gen = self._generate_stream(transcript, task, max_tokens)
             first = None
         elif first is not None and (same := find_parrot(first, list(heard))):

@@ -28,6 +28,7 @@ from bot.audio.receiver import SegmentingSink
 from bot.audio.segmenter import Utterance, UtteranceSegmenter
 from bot.brain.interest import InterestClassifier
 from bot.brain.drive import get_drive
+from bot.brain.knowledge import get_knowledge
 from bot.brain.llm import LLMRouter
 from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
@@ -47,7 +48,7 @@ NOISE_COMPLAINT_EVERY_S = 300
 STALE_UTTERANCE_S = 12      # фразы, ждавшие распознавания дольше, — выкидываем (бот отстал)
 OWN_CHECK_EVERY_S = 15      # как часто бот прикидывает «а не заговорить ли самому»
 OWN_LULL_S = 20             # сколько секунд тишины нужно, чтобы самому начать тему
-OWN_MIN_HUNGER = 0.6        # только когда сильно хочет (голод на провокации)
+OWN_MIN_CURIOSITY = 0.6     # только когда очень любопытно
 OWN_CHANCE = 0.35           # и не при каждой возможности
 
 
@@ -95,7 +96,7 @@ class VoiceSession:
         self._last_backchannel = 0.0
         self._seen_users: set[int] = set()   # кто уже говорил в этой сессии
         self._returning: set[str] = set()    # вернулись, и на них есть материал в памяти
-        self.drive = get_drive()              # голод на провокации и «сытость» каждым человеком
+        self.drive = get_drive()              # любопытство: растёт без нового, падает, когда узнал
         self._my_lines: deque[str] = deque(maxlen=12)  # свои последние реплики — чтобы не повторяться
         self._clarity: deque[tuple[float, bool]] = deque(maxlen=12)  # (когда, неразборчиво ли) — детектор шума
         self._last_noise_complaint = 0.0
@@ -166,12 +167,8 @@ class VoiceSession:
     def _relations_context(self) -> str:
         """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
-        people = {}
-        for name, uid in participants.items():
-            r = self.relations.get(uid, name)
-            people[name] = (len(r.facts) + len(r.plans) + len(r.hooks), r.score)
-        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants),
-                  self.drive.prompt_block(people) if people else "", self._my_lines_block()]
+        blocks = [get_knowledge().prompt_block(), self.self_model.prompt_block(),
+                  self.relations.prompt_block(participants), self.drive.prompt_block(), self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
     def _my_lines_block(self) -> str:
@@ -313,7 +310,7 @@ class VoiceSession:
         self._spawn(self.judge.maybe_update(self.buffer))  # досье/отношения в фоне (не чаще раза в 90 с)
         utt_end = utt.started_at + utt.duration_s
 
-        # человек впервые за сессию заговорил, а в памяти на него есть планы/зацепки — повод для провокации
+        # человек впервые за сессию заговорил, а в памяти на него есть планы/зацепки — повод спросить, как дела
         if utt.user_id not in self._seen_users:
             self._seen_users.add(utt.user_id)
             rel = self.relations.get(utt.user_id, utt.user_name)
@@ -362,7 +359,7 @@ class VoiceSession:
                 or now - self.policy.last_spoke < 60
                 or self.segmenter.seconds_since_last_voice() < OWN_LULL_S
                 or time.time() - last_human > 600          # в канале давно тишина — говорить не с кем
-                or self.drive.hunger < OWN_MIN_HUNGER
+                or self.drive.level < OWN_MIN_CURIOSITY
                 or random.random() > OWN_CHANCE):
             return
         self._last_own_initiative = now
@@ -457,8 +454,8 @@ class VoiceSession:
             log.debug("skip evaluation: %s", why or "proactive disabled")
             self.policy.reset_interest()
             return
-        if not follow_up and not self._returning and not self.drive.wants_to_provoke():
-            # сыт провокациями — сам не лезет и не тратит лимит на «а не влезть ли»
+        if not follow_up and not self._returning and not self.drive.wants_to_speak():
+            # сейчас не любопытно — сам не лезет и не тратит лимит на «а не влезть ли»
             self.policy.reset_interest()
             return
         if not self.policy.can_classify():
@@ -471,10 +468,10 @@ class VoiceSession:
             if self.policy.last_spoke else "Бот ещё ничего не говорил."
         if self._returning:
             hint += (f"\nТолько что впервые за сегодня появились в разговоре: {', '.join(sorted(self._returning))}. "
-                     "У них в памяти есть планы/зацепки — отличный повод с издёвкой спросить, как успехи.")
+                     "У них в памяти есть планы/зацепки — хороший повод спросить, как успехи.")
             self._returning.clear()
         transcript = self.buffer.render(self.buffer.recent(12))
-        memory = self._relations_context()  # зацепки и планы из памяти — лучший повод для провокации
+        memory = self._relations_context()  # знания, цели и планы людей — повод спросить
         verdict = await self.classifier.evaluate(transcript, hint + ("\n\n" + memory if memory else ""))
         log.info("verdict: %s", verdict)
         if self._reply_busy() or self._last_bot_seq != seq0:
@@ -608,6 +605,8 @@ class VoiceSession:
                          ", перебили" if cut else "", line.text)
                 self._speaking_proactive = False
                 self.policy.note_spoke(proactive)
+                if proactive and text:
+                    self.drive.on_spoke()
                 self._spawn(self.judge.maybe_update(self.buffer))  # пересмотреть отношения (не чаще раза в 90 с)
                 self._spawn(self.self_model.maybe_reflect(self.buffer))  # поразмышлять о себе (не чаще раза в 5 мин)
 

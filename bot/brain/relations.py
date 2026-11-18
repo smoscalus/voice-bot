@@ -1,16 +1,13 @@
-"""Память бота о людях: бессрочные досье + отношение (симпатия).
+"""Память бота о людях (бессрочные досье + симпатия) и летописец, который в фоне читает разговор.
 
-Досье подчинено цели бота (persona.MEMORY_GOAL) — у Петрыка это провокации: он запоминает
-не всё подряд, а то, что пригодится, чтобы потом зацепить человека.
-
-Досье каждого человека:
+Что и как запоминать, задаёт персонаж (persona.MEMORY_GOAL, persona.DOSSIER_HOOKS). Досье человека:
 - facts  — главное о человеке (чем живёт, во что играет, работа/учёба);
-- plans  — планы и обещания с датой («бросить универ (17.11)») — можно потом спросить, выполнил ли;
-- hooks  — зацепки для провокаций: хвастовство, слабости, противоречия, больные места, конфликты.
+- plans  — планы и обещания с датой («купить микрофон (17.11)») — можно потом спросить, как успехи;
+- hooks  — особенности человека: смысл задаёт персонаж (persona.DOSSIER_HOOKS).
 
-Память сама сжимается: при каждом обновлении модель переписывает списки целиком, оставляя
-только самое ценное (лимиты на длину ниже). Хранится в data/relations_<имя бота>.json.
-На скорость ответа почти не влияет: обновляется в фоне, а в ответ добавляется ~60 токенов на человека.
+Заодно летописец выписывает, что бот узнал О МИРЕ (bot/brain/knowledge.py) — с пометкой, кто рассказал.
+Память сама сжимается: модель переписывает списки целиком, оставляя самое ценное.
+Хранится в data/relations_<имя памяти>.json. Обновляется в фоне, на скорость ответа почти не влияет.
 """
 from __future__ import annotations
 
@@ -23,37 +20,38 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from bot.brain.drive import get_drive
+from bot.brain.knowledge import get_knowledge
 from bot.brain.llm import LLMRouter
 
 log = logging.getLogger(__name__)
 
 LIMITS = {"facts": 5, "plans": 4, "hooks": 5}  # пунктов в каждом разделе досье — память сама ужимается
 
-JUDGE_PROMPT = """Ты ведёшь долговременную память бота {name} из голосового чата: досье на людей и его отношение к ним.
+JUDGE_PROMPT = """Ты ведёшь долговременную память бота {name} из голосового чата.
 Цель бота: {goal}
 Поэтому запоминай НЕ всё подряд, а то, что ценно для этой цели.
 
-Тебе дают текущие досье, сегодняшнюю дату и свежие реплики. Для каждого человека из свежих реплик верни:
-- delta — изменение симпатии бота к нему: от -2 (всерьёз обидел, унизил бота) до +2 (поддержал, рассмешил,
-  дал боту классный материал). Не взаимодействовал с ботом — 0. Дружеские подколы и мат — не минус.
-- provoked — сколько раз в этих репликах БОТ провоцировал, подкалывал или троллил этого человека (0, 1, 2…).
+Тебе дают текущие досье, сегодняшнюю дату и свежие реплики.
+
+1) Для каждого человека из свежих реплик верни:
+- delta — изменение симпатии бота к нему: от -2 (всерьёз обидел бота) до +2 (был добр, многому научил,
+  рассмешил). Не взаимодействовал с ботом — 0. Дружеские подколы и мат — не минус.
 - facts — главное о человеке: чем живёт, работа/учёба, во что играет, увлечения. До {facts} пунктов.
 - plans — планы, намерения и обещания С ДАТОЙ, когда сказал: «купить микрофон (17.11)». До {plans} пунктов.
-  Выполненный или брошенный план убери из plans; если он сорвался или человек слился — перенеси в hooks
-  («обещал бросить универ — так и не бросил»).
-- hooks — зацепки для провокаций: хвастовство, слабости, противоречия (говорил одно — делает другое),
-  неудачи, больные места, с кем конфликтует. До {hooks} пунктов.
-ВАЖНО:
-- Факт записывай тому, О КОМ он, а не тому, кто его сказал. «Ты 60 еле поднял», сказанное Петей
-  Васе, — это зацепка Васи, а не Пети.
-- Всё, что человек собирается сделать в будущем («завтра экзамен», «в пятницу пересдаю», «на выходных
-  рыбалка», «хочу переехать») — ТОЛЬКО в plans с датой, а не в facts.
+  Выполненный или брошенный план убери.
+- hooks — {hooks_meaning} До {hooks} пунктов.
+ВАЖНО: факт записывай тому, О КОМ он, а не тому, кто его сказал. Всё про будущее — ТОЛЬКО в plans с датой.
 Каждый пункт — до 12 слов, по-русски. НЕ записывай манеру речи, мат, приветствия и пустую болтовню.
-Если в разделе ничего не изменилось — верни null (раздел останется прежним). Если изменилось — верни
-раздел ЦЕЛИКОМ, уже сжатый: объедини похожие пункты, выкинь самое неважное, если не влезает в лимит.
+Раздел без изменений — null. Изменился — верни его ЦЕЛИКОМ, уже сжатый (объедини похожее, выкинь мелочи).
 
-Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "provoked": число,
-  "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}]}}"""
+2) world — что бот УЗНАЛ О МИРЕ из этих реплик (до 6 пунктов): что значат слова и понятия, как что
+устроено, что люди рассказали или объяснили — особенно в ответ на вопросы бота. Не про конкретных людей
+(это в досье). Каждый пункт — короткий факт, как его понял бот, по-русски, и кто рассказал.
+Ничего не добавляй от себя — только то, что реально прозвучало. Нечего — пустой список.
+
+Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число,
+  "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
+  "world": [{{"text": "факт", "source": "ник"}}]}}"""
 
 
 @dataclass
@@ -80,7 +78,7 @@ class Relation:
         if self.plans:
             parts.append("планы: " + "; ".join(self.plans))
         if self.hooks:
-            parts.append("зацепки: " + "; ".join(self.hooks))
+            parts.append("особенности: " + "; ".join(self.hooks))
         return ". ".join(parts)
 
 
@@ -134,8 +132,9 @@ class RelationsStore:
             lines.append(f"- {name}: симпатия {rel.score:+.0f}/10 — {describe(rel.score)}." + (f" Досье — {d}." if d else ""))
         if not lines:
             return ""
-        return ("Твоя память об участниках (цифры вслух не называй; зацепки и планы — твои патроны для провокаций, "
-                "используй к месту, а не всё сразу):\n" + "\n".join(lines))
+        from bot import persona
+
+        return persona.PEOPLE_MEMORY_HEADER + "\n" + "\n".join(lines)
 
 
 _STORE: RelationsStore | None = None
@@ -147,7 +146,7 @@ def get_store() -> RelationsStore:
     if _STORE is None:
         from bot import persona
 
-        _STORE = RelationsStore(Path(f"data/relations_{persona.BOT_NAME}.json"))
+        _STORE = RelationsStore(Path(f"data/relations_{persona.MEMORY_ID}.json"))
     return _STORE
 
 
@@ -196,7 +195,8 @@ class RelationsJudge:
 
         self.store = store
         self.llm = llm
-        self.system = JUDGE_PROMPT.format(name=bot_name, goal=persona.MEMORY_GOAL, **LIMITS)
+        self.system = JUDGE_PROMPT.format(name=bot_name, goal=persona.MEMORY_GOAL,
+                                          hooks_meaning=persona.DOSSIER_HOOKS, **LIMITS)
         self._last_run = 0.0
         self._last_seq = 0
         self._lock = asyncio.Lock()
@@ -233,7 +233,8 @@ class RelationsJudge:
                     response_format={"type": "json_object"},
                     max_completion_tokens=900,
                 )
-                changes = json.loads(resp.choices[0].message.content or "{}").get("changes", [])
+                data = json.loads(resp.choices[0].message.content or "{}")
+                changes = data.get("changes", []) or []
             except Exception as e:
                 log.warning("не смог обновить память: %s", e)
                 return
@@ -248,10 +249,6 @@ class RelationsJudge:
                 except (TypeError, ValueError):
                     delta = 0.0
                 rel.score = max(-10.0, min(10.0, rel.score + delta))
-                try:  # сколько раз бот его провоцировал — утоляет голод и «насыщает» им
-                    get_drive().on_provoked(name, max(0, min(5, int(ch.get("provoked") or 0))))
-                except (TypeError, ValueError):
-                    pass
                 changed = []
                 for key, limit in LIMITS.items():
                     items = _clean_list(ch.get(key), limit)
@@ -264,3 +261,12 @@ class RelationsJudge:
                 if changed:
                     log.info("досье %s обновлено (%s): %s", name, ", ".join(changed), rel.dossier())
             self.store.save()
+            # что узнал о мире — в отдельную память знаний; новое утоляет любопытство
+            world = [(str(w.get("text", "")), str(w.get("source", ""))) for w in (data.get("world") or [])
+                     if isinstance(w, dict)]
+            knowledge = get_knowledge()
+            new = knowledge.add(world)
+            if new:
+                log.info("узнал о мире: %s", "; ".join(f.text for f in knowledge.facts[-new:]))
+                get_drive().on_learned(new)
+            asyncio.create_task(knowledge.maybe_compress(self.llm))

@@ -75,7 +75,7 @@ class Settings:
     quiet_gap_s: float
     classifier_max_per_hour: int
     barge_in_ms: int  # сколько мс надо проговорить поверх бота, чтобы он замолчал (0 = выкл)
-    interest_per_line: float  # «интерес» от любой реплики людей (тролль лезет чаще)
+    interest_per_line: float  # «интерес» от любой реплики людей (любопытный лезет чаще)
     sfx_enabled: bool  # «угу»/«хм…» голосом бота
     own_initiative_gap_s: float  # «свои дела»: сам начинает тему не чаще, чем раз в столько секунд
     persona_prompt: str  # auto / full / lite — полный или облегчённый характер (lite — для локальных моделей)
