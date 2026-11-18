@@ -38,7 +38,7 @@ from bot.brain.self_model import get_self_model
 from bot.brain.policy import SpeakPolicy
 from bot.brain.responder import Responder
 from bot.brain.transcript import TranscriptBuffer
-from bot.brain.triggers import TriggerDetector
+from bot.brain.triggers import TriggerDetector, voice_command
 from bot.config import Settings
 from bot.stt.base import STTEngine, clean_transcript
 
@@ -101,6 +101,8 @@ class VoiceSession:
         self._returning: set[str] = set()    # вернулись, и на них есть материал в памяти
         self.drive = get_drive()              # любопытство: растёт без нового, падает, когда узнал
         self.dead = False
+        self.muted_since: float | None = None  # «Петрык, помолчи» — молчит, но слушает и запоминает
+        self._unmuting = False
         self._mention: tuple[float, str] | None = None  # о нём говорили в третьем лице: (когда, фраза)
         self._last_vocative = 0.0                       # когда к нему последний раз обращались
         self._chat_proactive: deque[float] = deque(maxlen=10)  # встревал, пока люди болтали между собой
@@ -235,7 +237,7 @@ class VoiceSession:
                     and (get_health(self.vc).is_deaf() or self._receiver_dead())):
                 self._spawn(self._reconnect())
             # «угу»: человек долго рассказывает боту и сделал паузу — поддакнуть, как живой слушатель
-            if (self.sfx and not self.player.is_playing and self.policy.in_follow_up()
+            if (self.sfx and not self.muted_since and not self.player.is_playing and self.policy.in_follow_up()
                     and time.monotonic() - self._last_backchannel > 15
                     and self.segmenter.long_speech_pause() and random.random() < 0.5):
                 self._last_backchannel = time.monotonic()
@@ -342,6 +344,17 @@ class VoiceSession:
             self.player.interrupt()
             return
 
+        # 0) «Петрык, помолчи» / «Петрык, можешь говорить»
+        if trig.wake and (cmd := voice_command(trig.remainder, persona.MUTE_PHRASES, persona.UNMUTE_PHRASES)):
+            if cmd == "mute" and not self.muted_since:
+                self._mute(utt.user_name)
+                return
+            if cmd == "unmute" and self.muted_since:
+                self._spawn(self._unmute(utt.user_name))
+                return
+        if self.muted_since:
+            return  # молчит: слышит и запоминает (летописец работает), но не отвечает и не встревает
+
         # 1) прямое обращение («Петрык, …»). Если о нём говорят в третьем лице («Петрык думает») —
         #    это не обращение: решит внутренний голос, отозваться ли («эй, я всё слышу»)
         if trig.wake and not trig.vocative:
@@ -379,6 +392,8 @@ class VoiceSession:
         if now < self._next_own_check:
             return
         self._next_own_check = now + OWN_CHECK_EVERY_S
+        if self.muted_since:
+            return
         last_human = max((l.end_ts or l.ts for l in self.buffer.recent(10) if not l.is_bot), default=0.0)
         if (not self.proactive_enabled or self._reconnecting or self.player.is_playing or self._reply_busy()
                 or now - self._last_own_initiative < self.s.own_initiative_gap_s
@@ -413,6 +428,11 @@ class VoiceSession:
         if self._reconnecting or self.player.is_playing or self._reply_busy():
             return
         self._feel_left_out(now)
+        if self.muted_since:
+            if now - self.muted_since > getattr(persona, "MUTE_MAX_MINUTES", 30) * 60 and not self._reply_busy():
+                self._life_busy = True
+                self._spawn(self._unmute(None))  # про него забыли — сам осторожно спросит, можно ли уже
+            return
         life = get_life()
         if life.due_to_die() and self.segmenter.seconds_since_last_voice() > 4:
             self._life_busy = True
@@ -423,6 +443,37 @@ class VoiceSession:
         elif self.segmenter.seconds_since_last_voice() > 60 and book.due():
             self._life_busy = True  # затишье, а ему так и не объяснили — читает сам
             self._spawn(self._read_book())
+
+    def _mute(self, who: str) -> None:
+        """«Петрык, помолчи»: замолкает сразу (даже посреди фразы), тихо говорит «угу» и молчит."""
+        self.muted_since = time.monotonic()
+        log.info("%s попросил помолчать — молчу", who)
+        if self.player.is_playing:
+            self.player.interrupt()
+        elif self.sfx and (clip := self.sfx.random("back")):
+            self._spawn(self._play_clip(clip))
+        get_emotions().apply({"sadness": 0.1, "joy": -0.05})
+
+    async def _unmute(self, who: str | None) -> None:
+        """Снова можно говорить — реагирует по-своему (обрадовался, обиделся, сказал, что хотел)."""
+        if not self.muted_since:
+            return
+        from bot.brain.life import duration
+
+        minutes = duration(time.monotonic() - self.muted_since)
+        task = (persona.UNMUTE_TASK if who else persona.AUTO_UNMUTE_TASK).format(minutes=minutes)
+        log.info("%s — молчал %s", f"{who} разрешил говорить" if who else "сам не выдержал", minutes)
+        if who:
+            get_emotions().apply({"joy": 0.15})
+        self._unmuting = True
+        self.muted_since = None
+        try:
+            await self._speak_stream(
+                self.responder.stream_task(self.buffer.render(self.buffer.recent(20)), task, max_tokens=120),
+                proactive=False)
+        finally:
+            self._unmuting = False
+            self._life_busy = False
 
     def _people_chatting(self) -> bool:
         """Люди говорят между собой: последние реплики — от разных людей, бот в них не участвует
@@ -516,6 +567,8 @@ class VoiceSession:
     # ------------------------------------------------------------------ batched reply
     def _request_reply(self, utt_end: float) -> None:
         """Попросить ответ. Если ответ уже собирается — новая реплика просто попадёт в ту же пачку."""
+        if self.muted_since:
+            return
         if self._reply_task and not self._reply_task.done() and self._collecting:
             return
         # если бот сейчас отвечает — следующий ответ встанет в очередь за ним
@@ -547,6 +600,8 @@ class VoiceSession:
 
     # ------------------------------------------------------------------ decision
     def _schedule_evaluation(self) -> None:
+        if self.muted_since:
+            return
         # Одна отложенная оценка за раз: она сама подхватит все новые реплики,
         # т.к. берёт буфер в момент запуска.
         if self._eval_task and not self._eval_task.done():
@@ -716,6 +771,8 @@ class VoiceSession:
                     pass
 
     async def _speak_stream(self, sentences, *, proactive: bool, utt_end: float | None = None) -> None:
+        if self.muted_since and not self._unmuting:
+            return  # попросили помолчать — ни слова (кроме реакции на «можешь говорить»)
         # Свою же реплику не обрываем новым ответом: он подождёт очереди (_speak_lock).
         # Перебить бота можно голосом (barge-in) или стоп-словом.
         async with self._speak_lock:

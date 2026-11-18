@@ -18,6 +18,24 @@ _SECOND_PERSON = {"ты", "тебя", "тебе", "тобой", "твой", "т�
 _LEAD_WORDS = {"эй", "ну", "слушай", "а", "о", "так", "вот", "алло", "привет", "здарова", "здорово", "йо", "хей"}
 
 
+def voice_command(text: str, mute: list[str], unmute: list[str]) -> str | None:
+    """«помолчи» → "mute", «можешь говорить» → "unmute". «не молчи» — разрешение, а не просьба замолчать."""
+    # команда — в начале фразы после имени («Петрык, ну помолчи уже»), а не где-то в середине
+    #  («ты тихо говоришь» — не просьба замолчать)
+    t = " " + " ".join(normalize(text).split()[:4]) + " "
+    if t.split()[:1] in (["ты"], ["вы"], ["он"], ["я"]):
+        return None
+    for p in unmute:
+        ph = f" {normalize(p)} "
+        if ph in t and (ph.startswith(" не ") or f" не{ph}" not in t):  # «не говори» — это не разрешение
+            return "unmute"
+    for p in mute:
+        ph = f" {normalize(p)} "
+        if ph in t and f" не{ph}" not in t:
+            return "mute"
+    return None
+
+
 @dataclass
 class TriggerResult:
     wake: bool = False
