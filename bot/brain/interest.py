@@ -50,7 +50,7 @@ class InterestClassifier:
             resp = await self.llm.create(
                 messages=[{"role": "system", "content": self.system}, {"role": "user", "content": user}],
                 response_format={"type": "json_object"},
-                max_completion_tokens=300,
+                max_completion_tokens=300, tag="встревать ли",
             )
             data = json.loads(resp.choices[0].message.content or "{}")
         except Exception:

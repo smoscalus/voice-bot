@@ -185,6 +185,17 @@ def describe_trust(trust: float) -> str:
     return TRUST_STYLES[-1]
 
 
+FULL_DOSSIERS = 4      # полное досье в промпте — максимум у стольких (кто говорил последним)
+SHORT_STYLES = ["обижает тебя", "с ним бывает неприятно", "присматриваешься", "нравится", "очень близок"]
+
+
+def _style_index(score: float) -> int:
+    for i, limit in enumerate((-6, -2, 2, 6)):
+        if score <= limit if limit < 0 else score < limit:
+            return i
+    return 4
+
+
 def describe(score: float) -> str:
     """Как вести себя с человеком при такой симпатии — тексты задаёт персонаж (persona.RELATION_STYLES)."""
     from bot import persona
@@ -226,14 +237,20 @@ class RelationsStore:
         rel.name = name
         return rel
 
-    def prompt_block(self, participants: dict[str, int | None]) -> str:
-        """Кусок промпта: досье и отношение к тем, кто сейчас в разговоре."""
+    def prompt_block(self, participants: dict[str, int | None], active: list[str] | None = None) -> str:
+        """Кусок промпта: досье и отношение к тем, кто сейчас в разговоре.
+        Полное досье — только у тех, кто говорил только что (active, до FULL_DOSSIERS человек): досье — самый
+        тяжёлый блок промпта (~350 токенов на человека). Про остальных — одна строчка, как к ним относится."""
         from bot.brain.life import duration, get_life
 
         life = get_life()
-        lines = []
+        full = list(active or participants)[:FULL_DOSSIERS]
+        lines, brief = [], []
         for name, uid in participants.items():
             rel = self.get(uid, name)
+            if name not in full:
+                brief.append(f"{name} ({SHORT_STYLES[_style_index(rel.score)]})")
+                continue
             d = rel.dossier()
             gap = life.lived_s - rel.last_seen_lived if rel.last_seen_lived else 0
             seen = f" Не видел его {duration(gap)} (по твоему ощущению)." if gap > 3600 else ""
@@ -243,6 +260,8 @@ class RelationsStore:
             mom = rel.moments_text()
             lines.append(f"- {name}: {feel}." + (f" Запомнилось: {mom}." if mom else "")
                          + (f" Досье — {d}." if d else "") + seen)
+        if brief:
+            lines.append("- ещё в войсе: " + ", ".join(brief) + ".")
         missing = self.missing_block(set(participants))
         if not lines and not missing:
             return ""
@@ -410,7 +429,9 @@ class RelationsJudge:
     MIN_INTERVAL_S = 90
     BURST_LINES = 30        # столько новых реплик людей — обновляем, не дожидаясь 90 с
     BURST_MIN_INTERVAL_S = 30
-    MAX_LINES = 60          # сколько реплик максимум отдаём модели за раз
+    MAX_LINES = 45          # сколько реплик максимум отдаём модели за раз (влезть в окно 8k с запасом)
+    FULL_ROW_LINES = 2      # полное досье показываем тем, кто сказал хотя бы столько; остальным — только симпатия
+    FULL_ROWS_MAX = 5       # и не больше стольких за раз (иначе при 9 людях летописец упирается в окно)
     MIN_HUMAN_LINES = 6     # без участия бота — ждём, пока наберётся материал
 
     def __init__(self, store: RelationsStore, llm: LLMRouter, bot_name: str):
@@ -465,9 +486,17 @@ class RelationsJudge:
             self._last_run = time.monotonic()
             self._last_seq = buffer.last_seq
             rows = []
+            said = {n: sum(1 for l in new if l.speaker == n and not l.is_bot) for n in humans}
+            # полные досье — только самым разговорчивым (до FULL_ROWS_MAX), остальных обновит в следующий раз
+            talkers = sorted((n for n, k in said.items() if k >= self.FULL_ROW_LINES), key=lambda n: -said[n])
+            full_rows = set(talkers[:self.FULL_ROWS_MAX])
             for n, uid in humans.items():
                 r = self.store.get(uid, n)
-                rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
+                if n in full_rows:
+                    rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; "
+                                f"facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
+                else:  # сказал мимоходом — досье не показываем (и не даём его переписать, см. ниже)
+                    rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; досье не меняй (null)")
             from bot.brain.predict import get_predictor
 
             exps = get_predictor().matured(buffer)
@@ -484,7 +513,7 @@ class RelationsJudge:
                 resp = await self.llm.create(
                     messages=[{"role": "system", "content": self.system}, {"role": "user", "content": user}],
                     response_format={"type": "json_object"},
-                    max_completion_tokens=900,
+                    max_completion_tokens=900, tag="летописец",
                 )
                 data = json.loads(resp.choices[0].message.content or "{}")
                 changes = data.get("changes", []) or []
@@ -524,7 +553,7 @@ class RelationsJudge:
                     log.info("доверие к %s: %+d → %+.1f/10%s", name, tdelta, rel.trust,
                              f" (шрам {rel.scar:.1f})" if rel.scar else "")
                 changed = []
-                for key, limit in LIMITS.items():
+                for key, limit in (LIMITS.items() if name in full_rows else ()):
                     items = _clean_list(ch.get(key), limit)
                     if items is not None and items != getattr(rel, key):
                         setattr(rel, key, items)

@@ -73,9 +73,41 @@ async def _wait_turn() -> None:
         await asyncio.sleep(0.3)
 
 
+# ---------------------------------------------------------------- сколько влезло в голову
+# Локальная модель видит только CONTEXT_LIMIT токенов (OLLAMA_CONTEXT_LENGTH). Если промпт больше — Ollama
+# молча отрезает начало (а там характер), и бот ведёт себя странно. Поэтому пишем в лог реальный размер
+# (его сообщает сама модель) и предупреждаем, когда запас маленький.
+WARN_SHARE = 0.85
+
+
+def context_limit() -> int:
+    import os
+
+    try:
+        return int(os.getenv("OLLAMA_CONTEXT_LENGTH", "") or 8192)
+    except ValueError:
+        return 8192
+
+
+def note_usage(usage, tag: str, limit: int, max_out: int = 0) -> None:
+    """usage — из ответа модели (prompt_tokens / completion_tokens). limit=0 — облако, окно большое."""
+    prompt = getattr(usage, "prompt_tokens", None) if usage is not None else None
+    if not prompt:
+        return
+    if limit and prompt + max_out > limit * WARN_SHARE:
+        log.warning("🧠 %s: промпт %d токенов + ответ до %d — почти край окна %d! Модель может забыть начало "
+                    "(характер). Помогут OLLAMA_CONTEXT_LENGTH побольше или меньше людей в войсе.",
+                    tag or "запрос", prompt, max_out, limit)
+    else:
+        log.info("🧠 %s: промпт %d токенов%s", tag or "запрос", prompt,
+                 f" (запас {limit - prompt - max_out})" if limit else "")
+
+
 class LLMRouter:
     def __init__(self, client: AsyncOpenAI, models: list[str], reasoning_effort: str | None,
-                 timeout: float = 12.0, background: bool = False, preemptible: bool = False):
+                 timeout: float = 12.0, background: bool = False, preemptible: bool = False,
+                 ctx_limit: int = 0):
+        self.ctx_limit = ctx_limit        # окно модели (только локальная): следим, чтобы промпт влезал
         self.background = background      # фоновые дела: ждут, пока бот не отвечает людям
         self.preemptible = preemptible    # и обрываются, если ответ понадобился (имеет смысл для Ollama)
         self.client = client
@@ -107,6 +139,15 @@ class LLMRouter:
         raise RuntimeError("фоновое дело так и не дождалось очереди")
 
     async def _create(self, **kwargs):
+        tag = kwargs.pop("tag", "")
+        if kwargs.get("stream"):
+            kwargs.setdefault("stream_options", {"include_usage": True})  # размер промпта придёт в конце потока
+        resp = await self._create_raw(**kwargs)
+        if not kwargs.get("stream"):
+            note_usage(getattr(resp, "usage", None), tag, self.ctx_limit, kwargs.get("max_completion_tokens", 0))
+        return resp
+
+    async def _create_raw(self, **kwargs):
         now = time.monotonic()
         available = [m for m in self.models if self._blocked_until.get(m, 0) <= now] or self.models[-1:]
         last_err: Exception | None = None

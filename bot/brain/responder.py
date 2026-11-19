@@ -319,8 +319,14 @@ class Responder:
             stream=True,
         )
         buf = ""
+        usage_logged = False
         try:
             async for event in stream:
+                if getattr(event, "usage", None) and not usage_logged:
+                    from bot.brain.llm import note_usage
+
+                    usage_logged = True  # некоторые серверы присылают размер в двух кусках потока
+                    note_usage(event.usage, "ответ", getattr(self.llm, "ctx_limit", 0), max_tokens)
                 if not event.choices:
                     continue
                 buf += event.choices[0].delta.content or ""

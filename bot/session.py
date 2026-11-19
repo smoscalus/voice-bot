@@ -132,12 +132,16 @@ class VoiceSession:
         self.stt = stt
         fallbacks = settings.llm_fallback_models
         t = settings.llm_timeout_s
-        light_llm = LLMRouter(client, [settings.classifier_model, *fallbacks], settings.reasoning_effort, t)
+        from bot.brain.llm import context_limit
+
+        ctx = context_limit() if settings.provider == "local" else 0  # у облака окно большое — не следим
+        light_llm = LLMRouter(client, [settings.classifier_model, *fallbacks], settings.reasoning_effort, t,
+                              ctx_limit=ctx)
         self.light_llm = light_llm
         # память, дневник, книжка, сны — фоном: уступают очередь живому ответу (локальная модель одна на всё)
         memory_llm = LLMRouter(client, [settings.memory_model, settings.classifier_model, *fallbacks],
                                settings.reasoning_effort, max(t, 60), background=True,
-                               preemptible=settings.provider == "local")
+                               preemptible=settings.provider == "local", ctx_limit=ctx)
         self.classifier = InterestClassifier(light_llm, persona.BOT_NAME, persona.INTERVENE_RULES)
         if hasattr(self, "judge"):
             self.judge.llm = memory_llm
@@ -146,7 +150,7 @@ class VoiceSession:
         self.self_model = get_self_model(memory_llm)  # досье на самого себя: кто я, увлечения, задания, страхи
         self.self_model.llm = memory_llm
         self.responder = Responder(
-            LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t),
+            LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t, ctx_limit=ctx),
             self._system_prompt(settings), extra_context=self._relations_context,
             recent_lines=lambda: list(self._my_lines))
 
@@ -192,10 +196,12 @@ class VoiceSession:
     def _relations_context(self) -> str:
         """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
+        # кто говорил последним — первым (им полное досье, остальным одна строчка)
+        active = list(dict.fromkeys(l.speaker for l in reversed(self.buffer.recent(12)) if not l.is_bot))
         query = " ".join(l.text for l in self.buffer.recent(6))  # о чём сейчас речь — что из памяти вспомнить
         chat = "Сейчас люди разговаривают между собой, не с тобой." if self._people_chatting() else ""
         # редко меняющееся — в начало: локальная модель не пересчитывает одинаковое начало промпта
-        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants),
+        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants, active),
                   get_knowledge().prompt_block(query), get_life().prompt_block(), self.drive.prompt_block(),
                   get_emotions().prompt_block(), get_predictor().prompt_block(), get_monologue().prompt_block(),
                   chat, self._my_lines_block()]
