@@ -49,6 +49,111 @@ from bot.stt.base import STTEngine, clean_transcript
 log = logging.getLogger(__name__)
 
 UNCLEAR_CONFIDENCE = -0.8   # avg_logprob Whisper ниже этого — фраза распознана как каша
+# Whisper на шуме и тишине «слышит» фразы из субтитров YouTube. Такие короткие и неуверенные — выкидываем.
+WHISPER_GHOSTS = {"спасибо", "спасибо за внимание", "спасибо за просмотр", "добре", "подпишись", "подписывайтесь",
+                  "подписывайтесь на канал", "продолжение следует", "субтитры сделал dimatorzok",
+                  "редактор субтитров", "до новых встреч"}
+GHOST_CONFIDENCE = -0.3     # увереннее этого — человек правда сказал «спасибо»
+HURT_FELT_S = 3600          # обидчика опасается, только если обида свежая (за последний час прожитого)
+
+
+_ANGLE_TAG = "\x00угол\x00"
+_STOP = {"что", "значит", "это", "меня", "тебя", "можно", "такое", "какой", "какая", "почему", "можете",
+         "можешь", "расскажи", "рассказать", "подробнее", "вопрос", "спросить", "петрык", "петрик"}
+
+
+def _topic_words(text: str) -> set[str]:
+    return {w[:5] for w in re.findall(r"\w+", (text or "").lower()) if len(w) >= 4 and w not in _STOP}
+
+
+def _same_topic(angle: str, said: str) -> bool:
+    return len(_topic_words(angle) & _topic_words(said)) >= 2
+
+
+def _expect_if_on_topic(expect: str, angle: str) -> str:
+    """Классификатор ждёт реакции на свой «угол»; проверим при озвучке, что спросил он именно это."""
+    return f"{_ANGLE_TAG}{angle}{_ANGLE_TAG}{expect}" if expect and angle else expect
+
+
+class _Prefetch:
+    """Обёртка над потоком предложений: читает его сразу в фоне, не дожидаясь, пока его начнут озвучивать.
+    done — ответ целиком додуман; attach(line) — подставить додуманный текст в реплику бота заранее
+    (окончательный, с учётом перебиваний, запишется после озвучки)."""
+
+    _END = object()
+
+    def __init__(self, source):
+        self._q: asyncio.Queue = asyncio.Queue()
+        self.done = asyncio.Event()
+        self.items: list[str] = []
+        self._line = None
+        self._task = asyncio.create_task(self._run(source))
+
+    async def _run(self, source) -> None:
+        try:
+            async for x in source:
+                self.items.append(x)
+                await self._q.put(x)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("ответ не додумался")
+        finally:
+            self.done.set()
+            self._fill()
+            self._q.put_nowait(self._END)
+            if hasattr(source, "aclose"):
+                try:
+                    await source.aclose()
+                except Exception:
+                    pass
+
+    def _fill(self) -> None:
+        if self._line is not None and self.done.is_set() and self._line.text == "…" and self.items:
+            self._line.text = " ".join(self.items)
+
+    def attach(self, line) -> None:
+        self._line = line
+        self._fill()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        x = await self._q.get()
+        if x is self._END:
+            self._q.put_nowait(self._END)
+            raise StopAsyncIteration
+        return x
+
+    async def aclose(self) -> None:
+        if not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except BaseException:
+                pass
+
+
+FILLER_GAP_S = 6.0          # два «угу» подряд чаще — уже не рефлекс, а тик
+SPECULATIVE_RESTARTS = 2    # сколько раз можно передумать, если человек договорил ещё что-то
+
+
+def filler_kind(lines) -> str:
+    """Какой звук-рефлекс: позвали по имени — «м?», спросили — «хм…», рассказали — «угу»."""
+    last = lines[-1].text.strip() if lines else ""
+    if len(last.split()) <= 3 and "?" not in last:
+        return "call"          # «Петрык!», «Петрик, алло»
+    if "?" in last:
+        return "filler"
+    return "back"
+
+
+def is_whisper_ghost(text: str, confidence: float | None, duration_s: float) -> bool:
+    norm = re.sub(r"[^\w\s]", "", (text or "").lower()).strip()
+    norm = re.sub(r"\s+", " ", norm)
+    return (norm in WHISPER_GHOSTS and duration_s < 4.5
+            and (confidence is None or confidence < GHOST_CONFIDENCE))
 NOISE_MIN_LINES = 5         # сколько фраз за минуту смотреть, чтобы решить «вокруг шум»
 NOISE_UNCLEAR_SHARE = 0.6   # доля неразборчивых среди них
 NOISE_COMPLAINT_EVERY_S = 300
@@ -102,6 +207,12 @@ class VoiceSession:
         self._last_reconnect = time.monotonic()
         self._stt_inflight = 0
         self._collecting = False
+        self._gen_owner: asyncio.Task | None = None  # чей ответ сейчас думается
+        self._gen_done = asyncio.Event()
+        self._last_filler = 0.0  # когда звучал последний рефлекс «м?/угу»
+        self._merged = 0  # сколько новых обращений влилось в ответ, который ещё думается
+        self._rethink = asyncio.Event()  # бросил начатый ответ — озвучка может сказать «ага, так…»
+        self._classifying = False  # идёт ли запрос «встревать ли» (его можно бросить ради ответа)
         self._reply_task: asyncio.Task | None = None
         self._last_bot_seq = 0
         self.sfx = sfx  # «угу» и «хм…» голосом бота
@@ -158,7 +269,7 @@ class VoiceSession:
         self.responder = Responder(
             LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t, ctx_limit=ctx),
             self._system_prompt(settings), extra_context=self._relations_context,
-            recent_lines=lambda: list(self._my_lines))
+            recent_lines=lambda: list(self._my_lines), live_context=self._live_context)
 
     @staticmethod
     def _system_prompt(settings: Settings) -> str:
@@ -200,16 +311,20 @@ class VoiceSession:
         await self.vc.disconnect()
 
     def _relations_context(self) -> str:
-        """Память в промпт: кто я сам + досье тех, кто сейчас в разговоре."""
+        """Память в системный промпт — то, что между соседними ответами почти не меняется.
+        Локальная модель не перечитывает одинаковое начало промпта, поэтому всё подвижное — в _live_context."""
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
-        # кто говорил последним — первым (им полное досье, остальным одна строчка)
+        # кому полное досье — тем, кто говорил только что (остальным одна строчка)
         active = list(dict.fromkeys(l.speaker for l in reversed(self.buffer.recent(12)) if not l.is_bot))
+        blocks = [self.self_model.prompt_block(), get_habits().prompt_block(), get_knowledge().stable_block(),
+                  self.relations.prompt_block(participants, active)]
+        return "\n\n".join(b for b in blocks if b)
+
+    def _live_context(self) -> str:
+        """Подвижное — в самый конец промпта, перед расшифровкой: что вспомнилось, чувства, ожидания, мысли."""
         query = " ".join(l.text for l in self.buffer.recent(6))  # о чём сейчас речь — что из памяти вспомнить
         chat = "Сейчас люди разговаривают между собой, не с тобой." if self._people_chatting() else ""
-        # редко меняющееся — в начало: локальная модель не пересчитывает одинаковое начало промпта
-        blocks = [self.self_model.prompt_block(), get_habits().prompt_block(),
-                  self.relations.prompt_block(participants, active),
-                  get_knowledge().prompt_block(query), get_life().prompt_block(), self.drive.prompt_block(),
+        blocks = [get_knowledge().recall_block(query), get_life().prompt_block(), self.drive.prompt_block(),
                   get_emotions().prompt_block(), get_predictor().prompt_block(), get_monologue().prompt_block(),
                   chat, self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
@@ -340,6 +455,9 @@ class VoiceSession:
                     return
             text = clean_transcript(raw, persona.STT_PROMPT)
             if not text:
+                return
+            if is_whisper_ghost(text, confidence, utt.duration_s):
+                log.info("[%s] «%s» — похоже, Whisper додумал на шуме, пропускаю", utt.user_name, text)
                 return
             # Whisper не уверен — значит, скорее всего, каша: помечаем, чтобы бот мог переспросить
             unclear = confidence is not None and confidence < UNCLEAR_CONFIDENCE
@@ -579,7 +697,10 @@ class VoiceSession:
         d: dict[str, float] = {}
         if warm > 0.3:
             d["joy"] = min(0.15, 0.05 + 0.1 * warm)
-        if rel.score <= -3 or rel.trust <= -3:
+        fresh_hurt = any(m.get("sign", 0) < 0 and get_life().lived_s - m.get("lived", 0) < HURT_FELT_S
+                         for m in rel.moments)
+        if (rel.score <= -3 or rel.trust <= -3) and fresh_hurt:
+            # опасается, только пока обида свежая; старую помнит, но «привет» от него больше не пугает
             d.update(fear=0.08, trust=-0.05)
         elif rel.trust >= 3:
             d["trust"] = 0.05
@@ -769,31 +890,40 @@ class VoiceSession:
         if self.muted_since:
             return
         if self._reply_task and not self._reply_task.done() and self._collecting:
+            self._merged += 1  # ответ ещё не начал звучать — он передумает с учётом этой фразы
             return
+        if self._classifying and self._eval_task and not self._eval_task.done():
+            # к нему обратились, пока он прикидывал «а не влезть ли», — бросаем это, видеокарта нужна ответу
+            self._eval_task.cancel()
+            log.info("бросил раздумья «встревать ли» — к нему обратились")
         # если бот сейчас отвечает — следующий ответ встанет в очередь за ним
         prev = self._reply_task if self._reply_task and not self._reply_task.done() else None
         self._reply_task = self._spawn(self._reply_batch(utt_end, prev))
 
     async def _reply_batch(self, utt_end: float, prev: asyncio.Task | None = None) -> None:
-        with foreground():  # пока собираем пачку и отвечаем — фоновые дела ждут
-            await self._reply_batch_inner(utt_end, prev)
+        try:
+            with foreground():  # пока собираем пачку и отвечаем — фоновые дела ждут
+                await self._reply_batch_inner(utt_end, prev)
+        finally:
+            if self._reply_task is asyncio.current_task():
+                self._collecting = False  # вышли, так и не начав говорить (пусто, «ага» в мыслях, ошибка)
 
     async def _reply_batch_inner(self, utt_end: float, prev: asyncio.Task | None = None) -> None:
         self._collecting = True  # пока ждём — новые обращения вливаются в эту же пачку
         if prev is not None:
-            await asyncio.wait({prev})  # ждём, пока договорит прошлый ответ; потом ответим только на новое
-        # Собираем пачку: ждём, пока никто не говорит и все начатые фразы распознаны.
-        # Если в комнате тихо — проходит мгновенно, задержки нет.
-        deadline = time.monotonic() + 2.5
-        while time.monotonic() < deadline:
-            if (self._stt_inflight == 0 and not self.segmenter.someone_speaking(min_voiced_ms=200)
-                    and self.segmenter.seconds_since_last_voice() >= 0.3):
-                break
-            await asyncio.sleep(0.05)
-        self._collecting = False
-
+            # ждём не пока договорит, а пока ДОДУМАЕТ прошлый ответ: думать над новым можно, пока звучит старый
+            while not prev.done() and not (self._gen_owner is prev and self._gen_done.is_set()):
+                await asyncio.sleep(0.05)
+        # Пачку не ждём: начинаем думать сразу (рефлекс «м?» прикроет паузу). Если человек тут же
+        # договорил ещё фразу — до первого слова ответа передумаем с учётом её (см. _speculative).
+        # _collecting остаётся True, пока можно передумать: новые фразы вливаются сюда, а не в отдельный ответ.
+        seq0 = self._last_bot_seq
         cutoff = time.time() - 30
-        lines = [l for l in self.buffer.since(self._last_bot_seq) if not l.is_bot and l.ts >= cutoff][-8:]
+
+        def fresh_lines():
+            return [l for l in self.buffer.since(seq0) if not l.is_bot and l.ts >= cutoff][-8:]
+
+        lines = fresh_lines()
         if not lines:
             return
         transcript = self.buffer.render(self.buffer.recent(12))  # на обращения — небольшой контекст, экономим лимит
@@ -813,9 +943,42 @@ class VoiceSession:
         # ответ стримится по предложениям: озвучка стартует, пока модель дописывает остальное
         if repeat_note:
             note = f"{note}\n{repeat_note}".strip()
-        await self._speak_stream(self.responder.stream_batch(transcript, self.buffer.render(lines), note=note,
-                                                             allow_repeat=bool(repeat_note)),
-                                 proactive=False, utt_end=utt_end)
+        def make():
+            ls = fresh_lines() or lines
+            return self.responder.stream_batch(self.buffer.render(self.buffer.recent(12)), self.buffer.render(ls),
+                                               note=note, allow_repeat=bool(repeat_note))
+
+        await self._speak_stream(self._speculative(make), proactive=False, utt_end=utt_end,
+                                 filler=filler_kind(lines))
+
+    async def _speculative(self, make):
+        """Поток ответа, который можно начать заново, пока не прозвучало первое слово: человек договорил
+        ещё фразу (или её только что распознали) — бросаем начатое и думаем с ней. С кэшем промпта это дёшево."""
+        self._rethink.clear()
+        for attempt in range(SPECULATIVE_RESTARTS + 1):
+            seen = self.buffer.last_seq
+            self._merged = 0
+            pf = _Prefetch(make())
+            restart = False
+            while not (pf.items or pf.done.is_set()):
+                await asyncio.sleep(0.05)
+                if attempt < SPECULATIVE_RESTARTS and self._merged:
+                    restart = True
+                    break
+            if restart:
+                await pf.aclose()
+                self._rethink.set()
+                log.info("он договорил — передумываю ответ с учётом новой фразы")
+                continue
+            # решено: дальше новые фразы — уже в следующий ответ; всё, что видел этот, считаем отвеченным
+            self._collecting = False
+            self._last_bot_seq = max(self._last_bot_seq, seen)
+            try:
+                async for x in pf:
+                    yield x
+            finally:
+                await pf.aclose()
+            return
 
     # ------------------------------------------------------------------ decision
     def _schedule_evaluation(self) -> None:
@@ -883,8 +1046,12 @@ class VoiceSession:
             self._returning.clear()
         transcript = self.buffer.render(self.buffer.recent(12))
         memory = self._relations_context()  # знания, цели и планы людей — повод спросить
-        with foreground():
-            verdict = await self.classifier.evaluate(transcript, hint + ("\n\n" + memory if memory else ""))
+        self._classifying = True
+        try:
+            with foreground():
+                verdict = await self.classifier.evaluate(transcript, hint + ("\n\n" + memory if memory else ""))
+        finally:
+            self._classifying = False
         log.info("verdict: %s", verdict)
         if verdict.intervene or verdict.addressed_to_bot:
             get_monologue().note_interested()
@@ -914,7 +1081,7 @@ class VoiceSession:
                 return
             await self._speak_stream(
                 self.responder.stream_proactive(self.buffer.render(self.buffer.recent(20)), verdict.topic, verdict.angle),
-                proactive=True, expect=verdict.expect)
+                proactive=True, expect=_expect_if_on_topic(verdict.expect, verdict.angle))
 
     # ------------------------------------------------------------------ output
     async def _first_chunk_logged(self, chunks, utt_end: float | None):
@@ -975,15 +1142,32 @@ class VoiceSession:
         except Exception:
             log.exception("clip playback failed")
 
-    async def _with_filler(self, chunks):
-        """Если голос не готов за ~0.9 с — сначала «Хм…»/«Так…», чтобы не висела тишина."""
+    async def _with_filler(self, chunks, kind: str | None = None):
+        """Рефлекс, чтобы не висела тишина. На прямой вопрос (kind задан) — сразу, как начал думать: «м?» на
+        оклик, «хм…» на вопрос, «угу» на рассказ. Иначе — «хм…», только если голос не готов за ~0.9 с."""
         it = chunks.__aiter__()
         first = asyncio.ensure_future(it.__anext__())
         try:
-            done, _ = await asyncio.wait({first}, timeout=0.9)
-            if not done and self.sfx and (clip := self.sfx.random("filler")):
+            now = time.monotonic()
+            instant = bool(kind) and self.s.provider == "local" and now - self._last_filler >= FILLER_GAP_S
+            done, _ = await asyncio.wait({first}, timeout=0.05 if instant else 0.9)
+            if not done and self.sfx and (clip := self.sfx.random(kind if instant else "filler")):
+                self._last_filler = now
                 for i in range(0, len(clip), 4800):
                     yield clip[i : i + 4800]
+            # пока ждём первые слова: если он бросил начатое (человек договорил) — один раз «ага, так…»
+            again_said = False
+            while not first.done():
+                wake = asyncio.ensure_future(self._rethink.wait())
+                await asyncio.wait({first, wake}, return_when=asyncio.FIRST_COMPLETED)
+                wake.cancel()
+                if self._rethink.is_set():
+                    self._rethink.clear()
+                    if not again_said and not first.done() and self.sfx and (clip := self.sfx.random("again")):
+                        again_said = True
+                        self._last_filler = time.monotonic()
+                        for i in range(0, len(clip), 4800):
+                            yield clip[i : i + 4800]
             try:
                 chunk = await first
             except StopAsyncIteration:
@@ -1002,24 +1186,33 @@ class VoiceSession:
                     pass
 
     async def _speak_stream(self, sentences, *, proactive: bool, utt_end: float | None = None,
-                            expect: str = "") -> None:
+                            expect: str = "", filler: str | None = None) -> None:
         if self.muted_since and not self._unmuting:
             return  # попросили помолчать — ни слова (кроме реакции на «можешь говорить»)
         # Свою же реплику не обрываем новым ответом: он подождёт очереди (_speak_lock).
         # Перебить бота можно голосом (barge-in) или стоп-словом.
-        with foreground():
-            await self._speak_stream_inner(sentences, proactive=proactive, utt_end=utt_end, expect=expect)
+        pf = _Prefetch(sentences)  # модель начинает думать сразу, даже если ещё звучит прошлая реплика
+        self._gen_owner, self._gen_done = asyncio.current_task(), pf.done
+        try:
+            with foreground():
+                await self._speak_stream_inner(pf, proactive=proactive, utt_end=utt_end, expect=expect,
+                                               filler=filler)
+        finally:
+            await pf.aclose()
 
     async def _speak_stream_inner(self, sentences, *, proactive: bool, utt_end: float | None = None,
-                                  expect: str = "") -> None:
+                                  expect: str = "", filler: str | None = None) -> None:
         async with self._speak_lock:
             line = self.buffer.add(persona.BOT_NAME, "…", is_bot=True)
+            if isinstance(sentences, _Prefetch):
+                sentences.attach(line)  # как только текст додуман — он виден следующему ответу
             self._last_bot_seq = line.seq
             self._speaking_proactive = proactive
             said: list[str] = []
             try:
                 await self.player.play_stream(
-                    self._first_chunk_logged(self._with_filler(self._sentences_to_audio(sentences, said)), utt_end))
+                    self._first_chunk_logged(self._with_filler(self._sentences_to_audio(sentences, said), filler),
+                                             utt_end))
             except Exception:
                 log.exception("TTS/playback failed")
             finally:
@@ -1035,6 +1228,11 @@ class VoiceSession:
                     self._my_lines.append(text)
                     book.note_questions(text)  # о чём спросил — прочитает в книжке, если не ответят
                     get_habits().note_said(text)  # использованные словечки крепнут
+                    if expect and expect.startswith(_ANGLE_TAG):
+                        angle, expect = expect[len(_ANGLE_TAG):].split(_ANGLE_TAG, 1)
+                        if not _same_topic(angle, text):
+                            log.info("ожидание «%s» было про другой вопрос — не жду", expect)
+                            expect = ""
                     if expect:
                         get_predictor().add(text, expect, line.seq)  # потом сверит, как отреагировали
                 if not text:

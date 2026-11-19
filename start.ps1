@@ -147,10 +147,20 @@ if ($provider -eq "local") {
     if ($hostOllama) {
         Say "Нашёл Ollama на этом компьютере — использую её." "Green"
         Set-EnvValue "DOCKER_OLLAMA_URL" "http://host.docker.internal:11434"
-        # память бота + характер + разговор не влезают в стандартное окно Ollama (4096) — просим 8192
-        if (-not [Environment]::GetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "User")) {
-            [Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "8192", "User")
-            Say "Увеличил Ollama окно памяти до 8192. ПЕРЕЗАПУСТИ Ollama (значок у часов → Quit, и открыть снова)." "Yellow"
+        # Настройки Ollama для бота (ставим, только если человек сам их не задал):
+        #  OLLAMA_CONTEXT_LENGTH=8192 — память + характер + разговор не влезают в стандартное окно (4096)
+        #  OLLAMA_NUM_PARALLEL=2      — два «слота»: фоновые дела бота не затирают кэш живых ответов
+        #  OLLAMA_FLASH_ATTENTION=1   — быстрее и экономнее по видеопамяти (где видеокарта умеет)
+        $ollamaVars = [ordered]@{ "OLLAMA_CONTEXT_LENGTH" = "8192"; "OLLAMA_NUM_PARALLEL" = "2"; "OLLAMA_FLASH_ATTENTION" = "1" }
+        $changed = $false
+        foreach ($k in $ollamaVars.Keys) {
+            if (-not [Environment]::GetEnvironmentVariable($k, "User")) {
+                [Environment]::SetEnvironmentVariable($k, $ollamaVars[$k], "User")
+                $changed = $true
+            }
+        }
+        if ($changed) {
+            Say "Настроил Ollama под бота (окно 8192, 2 слота). ПЕРЕЗАПУСТИ Ollama (значок у часов → Quit, и открыть снова)." "Yellow"
         }
     } else {
         Set-EnvValue "DOCKER_OLLAMA_URL" "http://ollama:11434"

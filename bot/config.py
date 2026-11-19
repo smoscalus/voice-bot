@@ -170,7 +170,7 @@ def load_settings(provider: str | None = None) -> Settings:
         classifier_max_per_hour=_i("CLASSIFIER_MAX_PER_HOUR", 60),
         barge_in_ms=_i("BARGE_IN_MS", 0),
         interest_per_line=_f("INTEREST_PER_LINE", 0.7),
-        sfx_enabled=_s("SFX", "off").lower() in ("on", "1", "true"),
+        sfx_enabled=_s("SFX", "on").lower() in ("on", "1", "true"),
         own_initiative_gap_s=_f("OWN_INITIATIVE_GAP_S", 600),
         persona_prompt=_s("PERSONA_PROMPT", "auto").lower(),
     )

@@ -69,6 +69,15 @@ STAGES = [
 ]
 
 
+def _coarse_ago(seconds: float) -> str:
+    """Грубое «когда»: меняется раз в несколько часов, а не каждую минуту."""
+    if seconds < 6 * 3600:
+        return "недавно"
+    if seconds < 86400:
+        return "сегодня"
+    return f"{int(seconds // 86400)} дн назад"
+
+
 @dataclass
 class Fact:
     text: str
@@ -275,15 +284,21 @@ class Knowledge:
                 name, behaviour = n, b
         return name, behaviour
 
-    def _line(self, f: Fact, now_lived: float) -> str:
+    def _line(self, f: Fact, now_lived: float, coarse: bool = False) -> str:
         from bot.brain.life import ago
 
         who = "прочитал сам в книжке" if f.source == "книжка" else f"рассказал {f.source}" if f.source else ""
-        bits = [b for b in (who, ago(now_lived - f.lived) if f.lived else "",
+        when = (_coarse_ago(now_lived - f.lived) if coarse else ago(now_lived - f.lived)) if f.lived else ""
+        bits = [b for b in (who, when,
                             "смутно помнишь" if f.strength < VAGUE_BELOW else "") if b]
         return f"- {f.text}" + (f" ({', '.join(bits)})" if bits else "")
 
     def prompt_block(self, query: str = "") -> str:
+        return "\n".join(b for b in (self.stable_block(), self.recall_block(query)) if b)
+
+    def stable_block(self) -> str:
+        """Что знает о мире — неизменная между ответами часть (время грубое: «сегодня», а не «3 мин назад»),
+        чтобы локальная модель не перечитывала её каждый раз."""
         from bot.brain.life import get_life
 
         name, behaviour = self.stage()
@@ -295,11 +310,20 @@ class Knowledge:
             return head + "\n- пока ничего"
         now_lived = get_life().lived_s
         recent = sorted(active, key=lambda f: f.ts)[-SHOW_RECENT:]
+        return "\n".join([head, "Недавно узнал:", *[self._line(f, now_lived, coarse=True) for f in recent]])
+
+    def recall_block(self, query: str = "") -> str:
+        """Что вспомнилось к этому разговору — меняется каждый раз, идёт в конец промпта."""
+        from bot.brain.life import get_life
+
+        active = self.active
+        if not active:
+            return ""
+        now_lived = get_life().lived_s
+        recent = sorted(active, key=lambda f: f.ts)[-SHOW_RECENT:]
         rest = [f for f in active if f not in recent]
         rel = self.relevant(query, rest, SHOW_RELEVANT)
-        parts = [head, "Недавно узнал:", *[self._line(f, now_lived) for f in recent]]
-        if rel:
-            parts += ["Вспоминается к разговору:", *[self._line(f, now_lived) for f in rel]]
+        parts = ["Вспоминается к разговору:", *[self._line(f, now_lived) for f in rel]] if rel else []
         if self.revived:
             parts.append("Ты только что вспомнил давно забытое (тебе это уже рассказывали!): "
                          + "; ".join(self.revived[-3:]))

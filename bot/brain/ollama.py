@@ -22,6 +22,33 @@ async def ollama_alive(url: str) -> bool:
         return False
 
 
+async def report_gpu(url: str) -> None:
+    """После прогрева: сколько модели в видеопамяти. Не 100% — часть считает процессор, и ответы в разы медленнее."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as http:
+            async with http.get(f"{url}/api/ps") as r:
+                models = (await r.json()).get("models", [])
+    except Exception as e:
+        log.info("не смог спросить Ollama, где модель: %s", e)
+        return
+    for m in models:
+        size, vram = m.get("size") or 0, m.get("size_vram") or 0
+        if not size:
+            continue
+        pct = round(100 * vram / size)
+        name = m.get("name", "?")
+        if pct >= 99:
+            log.info("🎮 %s целиком на видеокарте (%.1f ГБ)", name, vram / 2**30)
+        elif pct == 0:
+            log.warning("🐢 %s работает на ПРОЦЕССОРЕ — видеокарту Ollama не видит, ответы будут очень медленными. "
+                        "Обнови Ollama; для AMD на Windows попробуй переменную OLLAMA_VULKAN=1 и перезапусти её.",
+                        name)
+        else:
+            log.warning("🐢 %s на видеокарте только на %d%% — остальное считает процессор, ответы медленные. "
+                        "Не хватает видеопамяти: закрой игры/браузер, возьми модель поменьше "
+                        "или уменьши OLLAMA_CONTEXT_LENGTH / OLLAMA_NUM_PARALLEL.", name, pct)
+
+
 async def ensure_ollama(url: str, models: list[str], wait_s: float = 120) -> None:
     """Ждёт Ollama до wait_s секунд и скачивает недостающие модели. Бросает RuntimeError, если Ollama нет."""
     for i in range(max(1, int(wait_s / 2))):

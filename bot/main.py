@@ -153,6 +153,11 @@ class VoiceBot(commands.Bot):
             log.info("LLM warmed up")
         except Exception as e:
             log.warning("LLM warmup failed: %s", e)
+            return
+        if self.settings.provider == "local":
+            from bot.brain.ollama import report_gpu
+
+            await report_gpu(self.settings.ollama_url)
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         # остались одни в канале — выходим, чтобы не жечь деньги на тишине

@@ -15,6 +15,8 @@ log = logging.getLogger(__name__)
 
 BACKCHANNEL = ["Угу.", "Ага.", "Мгм.", "Ну-ну.", "Ага, ага."]
 FILLERS = ["Хм…", "Так…", "Ммм…", "Ну…", "Эээ…", "Пф…"]
+CALLS = ["М?", "Да?", "А?", "Слушаю."]   # позвали по имени — отозвался, пока думает
+AGAIN = ["Ага…", "А, так…", "Угу, щас…", "А, ну…"]  # человек договорил ещё — «услышал, думаю заново»
 CACHE_DIR = Path("models/sfx")
 
 
@@ -37,7 +39,8 @@ class SoundBank:
     def __init__(self, tts, voice_key: str):
         self.tts = tts
         self.dir = CACHE_DIR / voice_key.replace("/", "_")
-        self.clips: dict[str, list[bytes]] = {"back": [], "filler": []}
+        self.clips: dict[str, list[bytes]] = {"back": [], "filler": [], "call": [], "again": []}
+        self._last: bytes | None = None
 
     async def _clip(self, text: str) -> bytes:
         path = self.dir / (hashlib.md5(text.encode()).hexdigest() + ".pcm")
@@ -54,14 +57,22 @@ class SoundBank:
         return pcm
 
     async def load(self) -> None:
-        for kind, texts, volume in (("back", BACKCHANNEL, 0.7), ("filler", FILLERS, 1.0)):
+        for kind, texts, volume in (("back", BACKCHANNEL, 0.7), ("filler", FILLERS, 1.0), ("call", CALLS, 1.0),
+                                     ("again", AGAIN, 1.0)):
             for t in texts:
                 try:
                     if pcm := await self._clip(t):
                         self.clips[kind].append(_scale(pcm, volume))
                 except Exception as e:
                     log.warning("не смогла подготовить звук %r: %s", t, e)
-        log.info("звуки готовы: угу ×%d, хм ×%d", len(self.clips["back"]), len(self.clips["filler"]))
+        log.info("звуки готовы: угу ×%d, хм ×%d, м? ×%d", len(self.clips["back"]), len(self.clips["filler"]),
+                 len(self.clips["call"]))
 
     def random(self, kind: str) -> bytes | None:
-        return random.choice(self.clips[kind]) if self.clips[kind] else None
+        """Случайный звук, но не тот же, что прозвучал только что («угу… угу» подряд режет слух)."""
+        pool = self.clips.get(kind) or []
+        if not pool:
+            return None
+        clip = random.choice([c for c in pool if c is not self._last] or pool)
+        self._last = clip
+        return clip
