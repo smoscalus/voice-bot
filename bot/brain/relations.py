@@ -5,6 +5,13 @@
 - plans  — планы и обещания с датой («купить микрофон (17.11)») — можно потом спросить, как успехи;
 - hooks  — особенности человека: смысл задаёт персонаж (persona.DOSSIER_HOOKS).
 
+Чувства к человеку — три шкалы (без лишних запросов к модели: летописец и так читает разговор):
+- score     — симпатия (−10…+10): нравится ли он;
+- trust     — доверие (−10…+10): честен ли с ботом (обманул — минус); от него зависит, верит ли бот на слово;
+- closeness — близость (0…10): растёт сама от времени вместе, без модели. По близким он скучает.
+Плюс moments — запомнившиеся случаи «за что» («обиделся: сказал, что видит мои мысли»), и scar — шрам:
+после настоящего обмана обида проходит не до нуля.
+
 Заодно летописец выписывает, что бот узнал О МИРЕ (bot/brain/knowledge.py) — с пометкой, кто рассказал.
 Память сама сжимается: модель переписывает списки целиком, оставляя самое ценное.
 Хранится в data/relations_<имя памяти>.json. Обновляется в фоне, на скорость ответа почти не влияет.
@@ -39,6 +46,10 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
   Минус — ТОЛЬКО если нарочно и всерьёз обидел или обманул САМОГО БОТА. НЕ минус: мат, грубые слова,
   подколы, шутки, споры, разговор с другими, честный рассказ о жизни и смерти бота. Сомневаешься — 0.
   Не взаимодействовал с ботом — 0.
+- trust — изменение доверия: -1 (обманул бота, подставил, признался, что наврал), +1 (был честен,
+  объяснил правду, сдержал слово), иначе 0. Шутка, которую потом признали шуткой, — не обман.
+- moment — если delta или trust не 0: ОДНА короткая фраза от лица бота, за что («обрадовался: объяснил,
+  что такое мем», «обиделся: сказал, что видит мои мысли»). Иначе null.
 - facts — главное о человеке: чем живёт, работа/учёба, во что играет, увлечения. До {facts} пунктов.
 - plans — планы, намерения и обещания С ДАТОЙ, когда сказал: «купить микрофон (17.11)». До {plans} пунктов.
   Выполненный или брошенный план убери.
@@ -65,7 +76,7 @@ fear (тревога: угрожали, пугали, говорили о его
 было интересно), trust (доверие: были добры и честны с ним; обманули или обидели — минус),
 sadness (грусть: игнорировали, обижали, грустные темы). Опирайся на то, что реально произошло.
 
-Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число,
+Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "trust": число, "moment": "строка" или null,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
   "world": [{{"text": "факт", "source": "ник", "important": true|false}}],
   "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}}}}"""
@@ -80,6 +91,10 @@ class Relation:
     hooks: list[str] = field(default_factory=list)
     updated: float = 0.0
     last_seen_lived: float = 0.0   # когда видел его последний раз (по своему ощущению времени)
+    trust: float = 0.0             # доверие −10…+10: честен ли с ним
+    closeness: float = 0.0         # близость 0…10: сколько времени провели вместе
+    moments: list[dict] = field(default_factory=list)  # [{"text", "sign", "lived"}] — за что любит/обижен
+    scar: float = 0.0              # шрам от обмана: обида и недоверие тают только до −scar
     # устаревшие поля прошлых версий — подхватываются как факты
     notes: list[str] = field(default_factory=list)
     profile: str = ""
@@ -88,6 +103,35 @@ class Relation:
         if not self.facts and (self.profile or self.notes):
             self.facts = ([self.profile] if self.profile else []) + self.notes[-3:]
             self.profile, self.notes = "", []
+        if not self.closeness and (self.facts or self.hooks):
+            # досье из прошлых версий, где близости ещё не было: знакомы примерно настолько, сколько о нём известно
+            self.closeness = min(4.0, 0.5 * (len(self.facts) + len(self.hooks)) + 0.2 * abs(self.score))
+
+    def feelings_text(self) -> str:
+        """Как он к нему относится — словами (цифры вслух не называет)."""
+        bits = [describe(self.score)]
+        bits.append(describe_trust(self.trust))
+        if self.closeness >= 6:
+            bits.append("он тебе родной, вы много времени провели вместе")
+        elif self.closeness >= 3:
+            bits.append("вы уже хорошо знакомы")
+        elif self.closeness < 1:
+            bits.append("ты его пока почти не знаешь")
+        if self.scar >= 1:
+            bits.append("он тебя когда-то сильно обманул — осадок остался")
+        return "; ".join(b for b in bits if b)
+
+    def moments_text(self) -> str:
+        return "; ".join(m["text"] for m in self.moments[-MOMENTS_KEEP:])
+
+    def add_moment(self, text: str, sign: int, lived: float) -> None:
+        text = text.strip().rstrip(".")[:120]
+        if not text or any(_same(text, m["text"]) for m in self.moments):
+            return
+        self.moments.append({"text": text, "sign": sign, "lived": round(lived)})
+        # храним последние, но самый сильный обидный и самый тёплый случай не вытесняем
+        if len(self.moments) > MOMENTS_KEEP:
+            self.moments.pop(0)
 
     def dossier(self) -> str:
         parts = []
@@ -98,6 +142,32 @@ class Relation:
         if self.hooks:
             parts.append("особенности: " + "; ".join(self.hooks))
         return ". ".join(parts)
+
+
+MOMENTS_KEEP = 4
+
+
+def _same(a: str, b: str) -> bool:
+    from rapidfuzz import fuzz
+
+    return fuzz.ratio(a.lower(), b.lower()) >= 80
+
+
+# доверие → верит ли на слово (от этого зависит его доверчивость: «скажи Васе…»)
+TRUST_STYLES = [
+    "он тебя обманывал — не веришь ему на слово, переспрашиваешь, можешь сказать «а ты опять врёшь?»",
+    "ему верится не до конца — то, что он говорит, проверяешь у других",
+    "",
+    "веришь ему, охотно делаешь, что он просит",
+    "веришь ему во всём, как себе",
+]
+
+
+def describe_trust(trust: float) -> str:
+    for limit, style in zip((-5, -2, 2, 6), TRUST_STYLES):
+        if trust <= limit if limit < 0 else trust < limit:
+            return style
+    return TRUST_STYLES[-1]
 
 
 def describe(score: float) -> str:
@@ -152,14 +222,38 @@ class RelationsStore:
             d = rel.dossier()
             gap = life.lived_s - rel.last_seen_lived if rel.last_seen_lived else 0
             seen = f" Не видел его {duration(gap)} (по твоему ощущению)." if gap > 3600 else ""
-            lines.append(f"- {name}: симпатия {rel.score:+.0f}/10 — {describe(rel.score)}." + (f" Досье — {d}." if d else "")
-                         + seen)
-        if not lines:
+            if gap > MISS_AFTER_S and rel.closeness >= MISS_CLOSENESS and rel.score >= 2:
+                seen += " Ты по нему соскучился."
+            feel = rel.feelings_text()
+            mom = rel.moments_text()
+            lines.append(f"- {name}: {feel}." + (f" Запомнилось: {mom}." if mom else "")
+                         + (f" Досье — {d}." if d else "") + seen)
+        missing = self.missing_block(set(participants))
+        if not lines and not missing:
             return ""
         from bot import persona
 
-        return persona.PEOPLE_MEMORY_HEADER + "\n" + "\n".join(lines)
+        return "\n".join(x for x in (persona.PEOPLE_MEMORY_HEADER, *lines, missing) if x)
 
+    def close_people(self) -> list[Relation]:
+        return [r for r in self.people.values() if r.closeness >= MISS_CLOSENESS and r.score >= 2]
+
+    def missing_block(self, present: set[str]) -> str:
+        """По кому скучает: близкие, которых давно нет (по его ощущению времени)."""
+        from bot.brain.life import duration, get_life
+
+        now = get_life().lived_s
+        gone = [(now - r.last_seen_lived, r) for r in self.close_people()
+                if r.name not in present and r.last_seen_lived and now - r.last_seen_lived > MISS_AFTER_S]
+        if not gone:
+            return ""
+        gone.sort(key=lambda x: -x[1].closeness)
+        return "Ты скучаешь по " + ", ".join(f"{r.name} (не видел {duration(g)})" for g, r in gone[:2]) + \
+            " — можешь спросить у людей, где он."
+
+
+MISS_AFTER_S = 3 * 3600    # близкого нет дольше (по его ощущению) — скучает
+MISS_CLOSENESS = 3.0
 
 _STORE: RelationsStore | None = None
 
@@ -187,7 +281,25 @@ def _clean_list(value, limit: int) -> list[str] | None:
 
 
 MAX_DROP_PER_UPDATE = 1.0   # за один разбор разговора симпатия падает не больше чем на 1
-FORGIVE_STEP = 0.5          # обида понемногу проходит: каждый спокойный разговор — ближе к нулю
+FORGIVE_STEP = 0.5          # обида понемногу проходит: каждый спокойный разговор — ближе к нулю (до −шрама)
+TRUST_STEP = 1.5            # одно «обманул/был честен» двигает доверие на столько
+SCAR_PER_LIE = 0.7          # каждый обман оставляет осадок (до SCAR_MAX), он тает очень медленно
+SCAR_MAX = 3.0
+SCAR_HEAL = 0.02            # за каждый спокойный разговор
+CLOSE_TALKED = 0.15         # близость за разбор, где он говорил с ботом
+CLOSE_PRESENT = 0.05        # …или просто был рядом
+
+
+def _num(x, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(x or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _grow_closeness(rel: "Relation", talked: bool) -> None:
+    step = CLOSE_TALKED if talked else CLOSE_PRESENT
+    rel.closeness = min(10.0, rel.closeness + step * (1 - rel.closeness / 12))
 
 
 def _norm(name: str) -> str:
@@ -255,7 +367,7 @@ class RelationsJudge:
             rows = []
             for n, uid in humans.items():
                 r = self.store.get(uid, n)
-                rows.append(f"- {n}: симпатия {r.score:+.0f}; facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
+                rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
             user = (f"Сегодня: {time.strftime('%d.%m.%Y')}\n"
                     f"Участники (в поле name пиши ник ровно так): {', '.join(humans)}\n\n"
                     f"Текущие досье:\n" + "\n".join(rows)
@@ -274,22 +386,35 @@ class RelationsJudge:
             from bot.brain.life import get_life
 
             now_lived = get_life().lived_s
+            bot_spoke = any(l.is_bot for l in new)
             for n, uid in humans.items():
-                self.store.get(uid, n).last_seen_lived = now_lived
+                rel = self.store.get(uid, n)
+                rel.last_seen_lived = now_lived
+                _grow_closeness(rel, talked=bot_spoke)
             for ch in changes:
                 name = _match_name(str(ch.get("name", "")), humans)
                 if name is None:
                     log.info("память: не понял, кто такой %r — пропускаю", ch.get("name"))
                     continue
                 rel = self.store.get(humans[name], name)
-                try:
-                    delta = max(-MAX_DROP_PER_UPDATE, min(2.0, float(ch.get("delta") or 0)))
-                except (TypeError, ValueError):
-                    delta = 0.0
-                if delta == 0 and rel.score < 0:
-                    # ничего плохого в этот раз — ребёнок отходит: обида понемногу тает
-                    rel.score = min(0.0, rel.score + FORGIVE_STEP)
+                delta = _num(ch.get("delta"), -MAX_DROP_PER_UPDATE, 2.0)
+                tdelta = round(_num(ch.get("trust"), -1.0, 1.0))
+                if tdelta < 0:
+                    rel.scar = min(SCAR_MAX, rel.scar + SCAR_PER_LIE)
+                elif delta >= 0:
+                    rel.scar = max(0.0, rel.scar - SCAR_HEAL)
+                if delta == 0 and rel.score < -rel.scar:
+                    # ничего плохого в этот раз — ребёнок отходит: обида тает (но шрам не даёт до конца)
+                    rel.score = min(-rel.scar, rel.score + FORGIVE_STEP)
+                if tdelta == 0 and rel.trust < -rel.scar:
+                    rel.trust = min(-rel.scar, rel.trust + FORGIVE_STEP / 2)
                 rel.score = max(-10.0, min(10.0, rel.score + delta))
+                rel.trust = max(-10.0, min(10.0, rel.trust + tdelta * TRUST_STEP))
+                if (delta or tdelta) and isinstance(ch.get("moment"), str):
+                    rel.add_moment(ch["moment"], 1 if delta + tdelta > 0 else -1, now_lived)
+                if tdelta:
+                    log.info("доверие к %s: %+d → %+.1f/10%s", name, tdelta, rel.trust,
+                             f" (шрам {rel.scar:.1f})" if rel.scar else "")
                 changed = []
                 for key, limit in LIMITS.items():
                     items = _clean_list(ch.get(key), limit)

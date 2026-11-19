@@ -119,6 +119,9 @@ class VoiceSession:
         self._last_own_initiative = time.monotonic()  # «свои дела» — не сразу после захода
         self._next_own_check = 0.0
         self._tasks: set[asyncio.Task] = set()
+        self._felt: dict[str, float] = {}     # когда последний раз «отозвалось» чувство к человеку
+        self._missed_back: set[str] = set()   # вернулся тот, по кому скучал
+        self._last_miss = time.monotonic()
 
     def set_brain(self, settings: Settings, client: AsyncOpenAI, stt: STTEngine) -> None:
         """Подключить «мозги» (local/groq). Вызывается при старте и при переключении командой /brain —
@@ -343,6 +346,7 @@ class VoiceSession:
                 self._returning.add(utt.user_name)
                 self._schedule_evaluation()
 
+        self._feel_person(utt.user_id, utt.user_name)
         trig = self.triggers.analyze(text)
 
         if trig.stop and self.player.is_playing:
@@ -441,6 +445,7 @@ class VoiceSession:
         if self._reconnecting or self.player.is_playing or self._reply_busy():
             return
         self._feel_left_out(now)
+        self._feel_missing(now)
         if self.muted_since:
             if now - self.muted_since > getattr(persona, "MUTE_MAX_MINUTES", 30) * 60 and not self._reply_busy():
                 self._life_busy = True
@@ -487,6 +492,45 @@ class VoiceSession:
         finally:
             self._unmuting = False
             self._life_busy = False
+
+    def _feel_person(self, user_id: int | None, name: str) -> None:
+        """Заговорил человек — у бота отзывается чувство к нему: близкому рад, обидчика опасается,
+        а если это тот, по кому скучал, — очень рад и сам поздоровается. Без запросов к модели."""
+        from bot.brain.relations import MISS_AFTER_S, MISS_CLOSENESS
+
+        now = time.monotonic()
+        if now - self._felt.get(name, -1e9) < 600:
+            return
+        self._felt[name] = now
+        rel = self.relations.get(user_id, name)
+        gap = get_life().lived_s - rel.last_seen_lived if rel.last_seen_lived else 0
+        warm = rel.score / 10 + rel.closeness / 20
+        d: dict[str, float] = {}
+        if warm > 0.3:
+            d["joy"] = min(0.15, 0.05 + 0.1 * warm)
+        if rel.score <= -3 or rel.trust <= -3:
+            d.update(fear=0.08, trust=-0.05)
+        elif rel.trust >= 3:
+            d["trust"] = 0.05
+        if gap > MISS_AFTER_S and rel.closeness >= MISS_CLOSENESS and rel.score >= 2:
+            d["joy"] = d.get("joy", 0) + 0.15
+            d["sadness"] = -0.1
+            self._missed_back.add(name)
+            self._returning.add(name)
+            self._schedule_evaluation()
+            log.info("вернулся %s — соскучился по нему", name)
+        if d:
+            get_emotions().apply(d)
+
+    def _feel_missing(self, now: float) -> None:
+        """Близких давно нет — тихонько грустит (раз в полчаса)."""
+        if now - self._last_miss < 1800:
+            return
+        self._last_miss = now
+        present = {l.speaker for l in self.buffer.recent(30) if not l.is_bot}
+        if self.relations.missing_block(present):
+            log.info("скучает по близким, которых давно нет")
+            get_emotions().apply({"sadness": 0.05})
 
     def _continues_with_me(self, text: str) -> bool:
         """Реплика явно продолжает разговор с ботом: он только что что-то сказал (особенно спросил),
@@ -715,6 +759,10 @@ class VoiceSession:
         elif chatting:
             hint += ("\nЛюди сейчас разговаривают МЕЖДУ СОБОЙ, не с ботом. Вклиниваться — только если тема "
                      "его по-настоящему цепляет; иначе intervene=false.")
+        if self._missed_back:
+            hint += (f"\nВернулся тот, по кому бот скучал: {', '.join(sorted(self._missed_back))}. Он рад — "
+                     "хочет поздороваться и спросить, где тот был (intervene=true).")
+            self._missed_back.clear()
         if self._returning:
             hint += (f"\nТолько что впервые за сегодня появились в разговоре: {', '.join(sorted(self._returning))}. "
                      "У них в памяти есть планы/зацепки — хороший повод спросить, как успехи.")

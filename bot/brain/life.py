@@ -276,7 +276,9 @@ async def write_epitaph(llm) -> str:
         get_life().status(), get_self_model(llm).prompt_block(), get_self_model(llm).dreams_block(),
         f"Узнал за жизнь {k.learned_total} вещей. Самое яркое:\n" + k.vivid_block(30),
         "Чувства в конце: " + get_emotions().describe(),
-        "Люди:\n" + "\n".join(f"- {r.name}: симпатия {r.score:+.0f}/10. {r.dossier()}" for r in people),
+        "Люди:\n" + "\n".join(f"- {r.name}: {r.feelings_text()}."
+                              + (f" Запомнилось: {r.moments_text()}." if r.moments else "") + f" {r.dossier()}"
+                              for r in people),
     ] if x)
     try:
         resp = await llm.create(
