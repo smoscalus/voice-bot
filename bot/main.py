@@ -20,6 +20,50 @@ from bot.tts import make_tts
 log = logging.getLogger("bot")
 
 
+async def _reset_voice(guild: discord.Guild) -> None:
+    """Сбросить старое голосовое подключение: «призрак» после резкого выключения (Discord думает,
+    что бот ещё в канале) — из-за него новое подключение висит и отваливается по таймауту."""
+    vc = guild.voice_client
+    if vc is not None:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+    if guild.me and guild.me.voice:
+        try:
+            await guild.change_voice_state(channel=None)
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+
+
+async def connect_voice(channel: discord.VoiceChannel):
+    """Зайти в канал. Не вышло (таймаут) — сбрасываем подключение и пробуем ещё раз."""
+    me = channel.guild.me
+    perms = channel.permissions_for(me) if me else None
+    if perms is not None and not (perms.view_channel and perms.connect and perms.speak):
+        raise PermissionError("нет прав")
+    await _reset_voice(channel.guild)
+    for attempt in (1, 2):
+        try:
+            return await channel.connect(cls=voice_recv.VoiceRecvClient, timeout=30)
+        except Exception as e:
+            log.warning("не смог зайти в голосовой канал (попытка %d): %r", attempt, e)
+            await _reset_voice(channel.guild)
+            if attempt == 2:
+                raise
+            await asyncio.sleep(3)
+
+
+def join_failed_text(e: Exception) -> str:
+    if isinstance(e, PermissionError):
+        return ("Не могу зайти: у меня нет прав в этом канале (нужны «Видеть канал», «Подключаться» "
+                "и «Говорить»). Дайте права роли бота и позовите снова.")
+    return ("Не получилось зайти в голосовой канал — Discord не ответил. Обычно помогает: отключить меня из "
+            "канала вручную (ПКМ по мне → «Отключить»), подождать полминуты и позвать снова. "
+            "Не помогло — перезапустите меня.")
+
+
 class VoiceBot(commands.Bot):
     def __init__(self, settings: Settings):
         intents = discord.Intents.default()
@@ -128,7 +172,11 @@ def register_commands(bot: VoiceBot) -> None:
             return
         if ctx.guild.id in bot.sessions:
             await bot.sessions.pop(ctx.guild.id).stop()
-        vc = await member.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
+        try:
+            vc = await connect_voice(member.voice.channel)
+        except Exception as e:
+            await ctx.reply(join_failed_text(e))
+            return
         session = VoiceSession(vc, bot.settings, bot.openai, bot.stt, bot.tts, bot.sfx)
         session.on_closed = lambda gid=ctx.guild.id, ss=session: bot.sessions.get(gid) is ss and bot.sessions.pop(gid)
         session.start()
@@ -152,7 +200,11 @@ def register_commands(bot: VoiceBot) -> None:
         guild_id = interaction.guild_id
         if guild_id in bot.sessions:
             await bot.sessions.pop(guild_id).stop()
-        vc = await member.voice.channel.connect(cls=voice_recv.VoiceRecvClient)
+        try:
+            vc = await connect_voice(member.voice.channel)
+        except Exception as e:
+            await interaction.followup.send(join_failed_text(e))
+            return
         session = VoiceSession(vc, bot.settings, bot.openai, bot.stt, bot.tts, bot.sfx)
         session.on_closed = lambda gid=guild_id, ss=session: bot.sessions.get(gid) is ss and bot.sessions.pop(gid)
         session.start()
