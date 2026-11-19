@@ -37,6 +37,7 @@ from bot.brain.llm import LLMRouter, foreground
 from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
 from bot.brain.policy import SpeakPolicy
+from bot.brain.predict import get_predictor
 from bot.brain.responder import Responder
 from bot.brain.transcript import TranscriptBuffer
 from bot.brain.triggers import _SECOND_PERSON, TriggerDetector, voice_command
@@ -195,7 +196,7 @@ class VoiceSession:
         # редко меняющееся — в начало: локальная модель не пересчитывает одинаковое начало промпта
         blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants),
                   get_knowledge().prompt_block(query), get_life().prompt_block(), self.drive.prompt_block(),
-                  get_emotions().prompt_block(), chat, self._my_lines_block()]
+                  get_emotions().prompt_block(), get_predictor().prompt_block(), chat, self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
     def _my_lines_block(self) -> str:
@@ -429,11 +430,14 @@ class VoiceSession:
         except Exception:
             log.exception("свои дела: не смог придумать")
             return
+        # «ОЖИДАЮ: …» — его прикидка, как отреагируют; вслух не произносится
+        parts = re.split(r"ожидаю\s*:", text or "", maxsplit=1, flags=re.IGNORECASE)
+        text, expect = parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
         if not text or "ПРОПУСК" in text.upper() or self.segmenter.seconds_since_last_voice() < 3:
             log.info("свои дела: решил промолчать")
             return
         log.info("свои дела: сам начинаю тему")
-        await self._speak(text, proactive=True)
+        await self._speak(text, proactive=True, expect=expect)
 
     # ------------------------------------------------------------------ жизнь: сны и смерть
     def _maybe_life_events(self) -> None:
@@ -796,7 +800,7 @@ class VoiceSession:
                 return
             await self._speak_stream(
                 self.responder.stream_proactive(self.buffer.render(self.buffer.recent(20)), verdict.topic, verdict.angle),
-                proactive=True)
+                proactive=True, expect=verdict.expect)
 
     # ------------------------------------------------------------------ output
     async def _first_chunk_logged(self, chunks, utt_end: float | None):
@@ -883,15 +887,17 @@ class VoiceSession:
                 except Exception:
                     pass
 
-    async def _speak_stream(self, sentences, *, proactive: bool, utt_end: float | None = None) -> None:
+    async def _speak_stream(self, sentences, *, proactive: bool, utt_end: float | None = None,
+                            expect: str = "") -> None:
         if self.muted_since and not self._unmuting:
             return  # попросили помолчать — ни слова (кроме реакции на «можешь говорить»)
         # Свою же реплику не обрываем новым ответом: он подождёт очереди (_speak_lock).
         # Перебить бота можно голосом (barge-in) или стоп-словом.
         with foreground():
-            await self._speak_stream_inner(sentences, proactive=proactive, utt_end=utt_end)
+            await self._speak_stream_inner(sentences, proactive=proactive, utt_end=utt_end, expect=expect)
 
-    async def _speak_stream_inner(self, sentences, *, proactive: bool, utt_end: float | None = None) -> None:
+    async def _speak_stream_inner(self, sentences, *, proactive: bool, utt_end: float | None = None,
+                                  expect: str = "") -> None:
         async with self._speak_lock:
             line = self.buffer.add(persona.BOT_NAME, "…", is_bot=True)
             self._last_bot_seq = line.seq
@@ -914,6 +920,8 @@ class VoiceSession:
                 if text and not cut:
                     self._my_lines.append(text)
                     book.note_questions(text)  # о чём спросил — прочитает в книжке, если не ответят
+                    if expect:
+                        get_predictor().add(text, expect, line.seq)  # потом сверит, как отреагировали
                 if not text:
                     self.buffer.remove(line)  # ничего не сказала — пустую реплику в память не пишем
                 log.info("BOT (%s%s): %s", "proactive" if proactive else "direct",
@@ -925,8 +933,8 @@ class VoiceSession:
                 self._spawn(self.judge.maybe_update(self.buffer))  # пересмотреть отношения (не чаще раза в 90 с)
                 self._spawn(self.self_model.maybe_reflect(self.buffer))  # поразмышлять о себе (не чаще раза в 5 мин)
 
-    async def _speak(self, text: str, *, proactive: bool, utt_end: float | None = None) -> None:
+    async def _speak(self, text: str, *, proactive: bool, utt_end: float | None = None, expect: str = "") -> None:
         if text:
             async def one():
                 yield text
-            await self._speak_stream(one(), proactive=proactive, utt_end=utt_end)
+            await self._speak_stream(one(), proactive=proactive, utt_end=utt_end, expect=expect)

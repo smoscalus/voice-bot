@@ -19,10 +19,13 @@ CLASSIFIER_PROMPT = """Ты — модуль принятия решений д�
 2. intervene — стоит ли боту вклиниться по собственной инициативе:
 {rules}
 
+3. expect — если intervene: как, по-твоему, люди отреагируют на его реплику, одна короткая фраза
+   («Вася посмеётся», «мне объяснят, что это», «проигнорят»). Иначе пустая строка.
+
 Все текстовые поля пиши только на русском языке.
 Ответь строго JSON:
 {{"addressed_to_bot": bool, "intervene": bool, "confidence": число 0..1,
-  "topic": "строка", "angle": "что именно бот скажет, одна фраза", "reason": "коротко"}}"""
+  "topic": "строка", "angle": "что именно бот скажет, одна фраза", "expect": "строка", "reason": "коротко"}}"""
 
 
 @dataclass
@@ -33,6 +36,7 @@ class InterestVerdict:
     topic: str = ""
     angle: str = ""
     reason: str = ""
+    expect: str = ""   # как, по его мнению, люди отреагируют (потом сверит)
 
 
 class InterestClassifier:
@@ -59,4 +63,5 @@ class InterestClassifier:
             topic=str(data.get("topic") or ""),
             angle=str(data.get("angle") or ""),
             reason=str(data.get("reason") or ""),
+            expect=str(data.get("expect") or ""),
         )

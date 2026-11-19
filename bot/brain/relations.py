@@ -76,10 +76,17 @@ fear (тревога: угрожали, пугали, говорили о его
 было интересно), trust (доверие: были добры и честны с ним; обманули или обидели — минус),
 sadness (грусть: игнорировали, обижали, грустные темы). Опирайся на то, что реально произошло.
 
+4) expectations — только если в сообщении есть раздел «Ожидания бота»: для каждого пункта сверь,
+что бот ждал, с тем, что реально было после его реплики. outcome: "match" (в главном так и вышло, даже
+если с подколами), "good" (вышло заметно лучше, чем ждал), "bad" (ждал хорошего, а его проигнорили, обсмеяли, обидели), "miss" (просто не угадал,
+ни хорошо ни плохо). Молчание в ответ — тоже реакция. who — ник того, чья реакция главная (или "").
+what — что было на деле, коротко. Нет раздела — пустой список.
+
 Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "trust": число, "moment": "строка" или null,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
   "world": [{{"text": "факт", "source": "ник", "important": true|false}}],
-  "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}}}}"""
+  "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}},
+  "expectations": [{{"n": номер, "outcome": "match|good|bad|miss", "who": "ник", "what": "строка"}}]}}"""
 
 
 @dataclass
@@ -322,6 +329,36 @@ def _match_name(name: str, humans: dict[str, int | None]) -> str | None:
     return None
 
 
+def _apply_expectations(store: "RelationsStore", exps: list, results, humans: dict) -> None:
+    """Сверка «ждал — получил»: слабо двигает чувства и доверие к тому, кто удивил."""
+    from bot.brain.predict import EFFECT, PERSON_TRUST, get_predictor
+
+    if not exps or not isinstance(results, list):
+        return
+    pred = get_predictor()
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        try:
+            e, _ = exps[int(r.get("n", 0)) - 1]
+        except (ValueError, TypeError, IndexError):
+            continue
+        outcome = str(r.get("outcome", "")).lower()
+        if outcome not in EFFECT:
+            continue
+        what = str(r.get("what") or "")
+        pred.resolve(e, outcome, what)
+        get_emotions().apply(EFFECT[outcome])
+        who = _match_name(str(r.get("who") or ""), humans)
+        if who and outcome in PERSON_TRUST:
+            rel = store.get(humans[who], who)
+            rel.trust = max(-10.0, min(10.0, rel.trust + PERSON_TRUST[outcome]))
+        log.info("предчувствие: ждал «%s» — %s%s", e.expect,
+                 {"match": "так и вышло", "good": "вышло лучше", "bad": "вышло хуже", "miss": "не угадал"}[outcome],
+                 f" ({what})" if what else "")
+    store.save()
+
+
 class RelationsJudge:
     """В фоне обновляет досье и отношения по свежим репликам.
 
@@ -346,6 +383,12 @@ class RelationsJudge:
         self._last_seq = 0
         self._lock = asyncio.Lock()
 
+    def _check_expectations(self, exps, results, humans) -> None:
+        try:
+            _apply_expectations(self.store, exps, results, humans)
+        except Exception:
+            log.exception("предчувствие: не смог сверить")
+
     async def maybe_update(self, buffer, force: bool = False) -> None:
         if self._lock.locked():
             return
@@ -368,10 +411,18 @@ class RelationsJudge:
             for n, uid in humans.items():
                 r = self.store.get(uid, n)
                 rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
+            from bot.brain.predict import get_predictor
+
+            exps = get_predictor().matured(buffer)
             user = (f"Сегодня: {time.strftime('%d.%m.%Y')}\n"
                     f"Участники (в поле name пиши ник ровно так): {', '.join(humans)}\n\n"
                     f"Текущие досье:\n" + "\n".join(rows)
                     + f"\n\nСвежие реплики:\n{buffer.render(new)}")
+            if exps:
+                user += "\n\nОжидания бота (сверь с тем, что было после):\n" + "\n".join(
+                    f"{i}) бот сказал «{e.said}» и ждал: «{e.expect}». После этого: "
+                    + (buffer.render(after).replace("\n", " | ") if after else "никто ничего не ответил")
+                    for i, (e, after) in enumerate(exps, 1))
             try:
                 resp = await self.llm.create(
                     messages=[{"role": "system", "content": self.system}, {"role": "user", "content": user}],
@@ -429,6 +480,7 @@ class RelationsJudge:
             self.store.save()
             if isinstance(data.get("feelings"), dict):
                 get_emotions().apply(data["feelings"])
+            self._check_expectations(exps, data.get("expectations"), humans)
             # что узнал о мире — в отдельную память знаний; новое утоляет любопытство
             world = [(str(w.get("text", "")), str(w.get("source", "")), w.get("important") is True)
                      for w in (data.get("world") or []) if isinstance(w, dict)]
