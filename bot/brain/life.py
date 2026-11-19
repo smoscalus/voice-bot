@@ -318,7 +318,7 @@ def bury(epitaph: str, last_words: str) -> Path:
 def reset_all() -> None:
     """Забыть все загруженные памяти — следующее обращение откроет память новой жизни."""
     global _LIFE
-    from bot.brain import drive, emotions, knowledge, predict, relations, self_model
+    from bot.brain import drive, emotions, knowledge, monologue, predict, relations, self_model
 
     _LIFE = None
     relations._STORE = None
@@ -327,3 +327,4 @@ def reset_all() -> None:
     emotions._EMOTIONS = None
     drive._DRIVE = None
     predict._PREDICTOR = None
+    monologue._MONO = None

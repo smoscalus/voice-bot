@@ -75,6 +75,8 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
 fear (тревога: угрожали, пугали, говорили о его выключении или смерти), joy (радость: хвалили, смешили,
 было интересно), trust (доверие: были добры и честны с ним; обманули или обидели — минус),
 sadness (грусть: игнорировали, обижали, грустные темы). Опирайся на то, что реально произошло.
+touched — если что-то из этого СИЛЬНО задело бота (о его смерти, выключении, обида, страшное, очень важное
+для него) — одна короткая фраза, что именно; иначе null. Обычная болтовня — null.
 
 4) expectations — только если в сообщении есть раздел «Ожидания бота». Для каждого пункта ответь на
 ТРИ отдельных вопроса:
@@ -91,7 +93,7 @@ who — ник того, чья реакция главная (или ""). what 
 Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "trust": число, "moment": "строка" или null,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
   "world": [{{"text": "факт", "source": "ник", "important": true|false}}],
-  "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}},
+  "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}}, "touched": "строка" или null,
   "expectations": [{{"n": номер, "answered": true|false, "happened": true|false, "nice": -1|0|1, "who": "ник", "what": "строка"}}]}}"""
 
 
@@ -422,6 +424,22 @@ class RelationsJudge:
         self._last_seq = 0
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _note_touched(data: dict) -> None:
+        """Сильно задело — потом «переварит» в своих мыслях (bot/brain/monologue.py)."""
+        touched = data.get("touched")
+        feelings = data.get("feelings") if isinstance(data.get("feelings"), dict) else {}
+        try:
+            strong = max(float(feelings.get("fear") or 0), float(feelings.get("sadness") or 0)) >= 0.25
+        except (TypeError, ValueError):
+            strong = False
+        important = any(isinstance(w, dict) and w.get("important") is True for w in (data.get("world") or []))
+        if isinstance(touched, str) and touched.strip() and (strong or important):
+            from bot.brain.monologue import get_monologue
+
+            get_monologue().touched = touched.strip()[:120]
+            log.info("его задело: %s", touched.strip())
+
     def _check_expectations(self, exps, results, humans) -> None:
         try:
             _apply_expectations(self.store, exps, results, humans)
@@ -519,6 +537,7 @@ class RelationsJudge:
             self.store.save()
             if isinstance(data.get("feelings"), dict):
                 get_emotions().apply(data["feelings"])
+            self._note_touched(data)
             self._check_expectations(exps, data.get("expectations"), humans)
             # что узнал о мире — в отдельную память знаний; новое утоляет любопытство
             world = [(str(w.get("text", "")), str(w.get("source", "")), w.get("important") is True)

@@ -38,6 +38,7 @@ from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
 from bot.brain.policy import SpeakPolicy
 from bot.brain.predict import get_predictor
+from bot.brain.monologue import get_monologue
 from bot.brain.responder import Responder
 from bot.brain.transcript import TranscriptBuffer
 from bot.brain.triggers import _SECOND_PERSON, TriggerDetector, voice_command
@@ -196,7 +197,8 @@ class VoiceSession:
         # редко меняющееся — в начало: локальная модель не пересчитывает одинаковое начало промпта
         blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants),
                   get_knowledge().prompt_block(query), get_life().prompt_block(), self.drive.prompt_block(),
-                  get_emotions().prompt_block(), get_predictor().prompt_block(), chat, self._my_lines_block()]
+                  get_emotions().prompt_block(), get_predictor().prompt_block(), get_monologue().prompt_block(),
+                  chat, self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
     def _my_lines_block(self) -> str:
@@ -410,7 +412,7 @@ class VoiceSession:
         if now < self._next_own_check:
             return
         self._next_own_check = now + OWN_CHECK_EVERY_S
-        if self.muted_since:
+        if self.muted_since or get_monologue().active:
             return
         last_human = max((l.end_ts or l.ts for l in self.buffer.recent(10) if not l.is_bot), default=0.0)
         if (not self.proactive_enabled or self._reconnecting or self.player.is_playing or self._reply_busy()
@@ -456,15 +458,67 @@ class VoiceSession:
                 self._spawn(self._unmute(None))  # про него забыли — сам осторожно спросит, можно ли уже
             return
         life = get_life()
+        mono = get_monologue()
+        if not life.due_to_die() and self._monologue_step(mono):
+            return
         if life.due_to_die() and self.segmenter.seconds_since_last_voice() > 4:
             self._life_busy = True
             self._spawn(self._die())
         elif life.dream_pending and self.segmenter.seconds_since_last_voice() > 120:
             self._life_busy = True  # в войсе тихо пару минут — задремал
             self._spawn(self._dream())
-        elif self.segmenter.seconds_since_last_voice() > 25 and book.due():
+        elif self.segmenter.seconds_since_last_voice() > 25 and not mono.active and book.due():
             self._life_busy = True  # короткое затишье, а ему так и не объяснили — читает сам (фоном)
             self._spawn(self._read_book())
+
+    def _monologue_step(self, mono) -> bool:
+        """Внутренний монолог: уйти в себя / подумать мысль / вынырнуть. True — занялся этим."""
+        if mono.active:
+            if why := mono.should_end():
+                thoughts = mono.come_out(why)
+                if thoughts and not self.muted_since:
+                    self._life_busy = True
+                    self._spawn(self._share_thoughts(thoughts, heavy="тяжёл" in why))
+                    return True
+                return False
+            if mono.due_thought():
+                self._life_busy = True
+                self._spawn(self._think(mono))
+                return True
+            return False
+        if why := mono.wants_to_go_in():
+            mono.go_in(why)
+            self._mention = None
+        return False
+
+    async def _think(self, mono) -> None:
+        try:
+            query = mono.about or " ".join(l.text for l in self.buffer.recent(6))
+            context = "\n\n".join(b for b in [
+                self.self_model.prompt_block(), get_emotions().prompt_block(),
+                get_knowledge().prompt_block(query), get_predictor().prompt_block()] if b)
+            await mono.think(self.judge.llm, persona.BOT_NAME, context, self.buffer.render(self.buffer.recent(10)))
+        finally:
+            self._life_busy = False
+
+    async def _share_thoughts(self, thoughts: list[str], heavy: bool) -> None:
+        """Додумал — делится, к чему пришёл; мысли стали тяжёлыми — выныривает к людям."""
+        try:
+            for _ in range(40):  # ждём паузы в разговоре (до ~20 с), не перебиваем
+                if self.segmenter.seconds_since_last_voice() >= 2 and not self._reply_busy():
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                return  # так и не замолчали — поделится потом (мысли есть в памяти)
+            task = (persona.SHAKE_OFF_TASK if heavy else persona.SHARE_THOUGHTS_TASK).format(
+                thoughts="\n".join(f"- {t}" for t in thoughts))
+            if heavy:
+                get_emotions().apply({"joy": 0.05, "fear": -0.05})  # к людям — легче
+            await self._speak_stream(
+                self.responder.stream_task(self.buffer.render(self.buffer.recent(12)), task, max_tokens=120),
+                proactive=True)
+        finally:
+            self._life_busy = False
 
     def _mute(self, who: str) -> None:
         """«Петрык, помолчи»: замолкает сразу (даже посреди фразы), тихо говорит «угу» и молчит."""
@@ -521,6 +575,8 @@ class VoiceSession:
             d["sadness"] = -0.1
             self._missed_back.add(name)
             self._returning.add(name)
+            if get_monologue().active:
+                get_monologue().come_out(f"вернулся {name}")
             self._schedule_evaluation()
             log.info("вернулся %s — соскучился по нему", name)
         if d:
@@ -706,8 +762,20 @@ class VoiceSession:
         if not lines:
             return
         transcript = self.buffer.render(self.buffer.recent(12))  # на обращения — небольшой контекст, экономим лимит
+        note = ""
+        mono = get_monologue()
+        if mono.active:
+            last = mono.session[-1] if mono.session else "о своём"
+            if not mono.note_call():
+                # в своих мыслях: «ага», «норм», «щас, я думаю»
+                await self._speak_stream(self.responder.stream_task(
+                    transcript, persona.DISTRACTED_TASK.format(thought=last, lines=self.buffer.render(lines)),
+                    max_tokens=30), proactive=False, utt_end=utt_end)
+                return
+            mono.come_out("выдернули")  # зовут настойчиво — выныривает
+            note = persona.PULLED_OUT_NOTE.format(thought=last)
         # ответ стримится по предложениям: озвучка стартует, пока модель дописывает остальное
-        await self._speak_stream(self.responder.stream_batch(transcript, self.buffer.render(lines)),
+        await self._speak_stream(self.responder.stream_batch(transcript, self.buffer.render(lines), note=note),
                                  proactive=False, utt_end=utt_end)
 
     # ------------------------------------------------------------------ decision
@@ -732,6 +800,8 @@ class VoiceSession:
         return bool(self._reply_task and not self._reply_task.done())
 
     async def _evaluate(self) -> None:
+        if get_monologue().active:
+            return  # ушёл в свои мысли — сам не встревает и не тратит запросы на «а не влезть ли»
         if not await self._wait_quiet():
             return
         if self._reply_busy():
@@ -746,6 +816,7 @@ class VoiceSession:
         if not follow_up and not self._returning and not self.drive.wants_to_speak(get_emotions().talk_bias()):
             # сейчас не любопытно — сам не лезет и не тратит лимит на «а не влезть ли»
             self.policy.reset_interest()
+            get_monologue().note_bored()
             return
         if not self.policy.can_classify():
             log.warning("classifier hourly budget exhausted")
@@ -776,6 +847,10 @@ class VoiceSession:
         with foreground():
             verdict = await self.classifier.evaluate(transcript, hint + ("\n\n" + memory if memory else ""))
         log.info("verdict: %s", verdict)
+        if verdict.intervene or verdict.addressed_to_bot:
+            get_monologue().note_interested()
+        else:
+            get_monologue().note_bored()
         if self._reply_busy() or self._last_bot_seq != seq0:
             return  # пока думали, бот уже ответил — второй раз не лезем
 

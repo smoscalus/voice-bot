@@ -206,10 +206,11 @@ class Responder:
         return await self._generate(transcript, self._task_proactive(topic, angle))
 
     # ---------------------------------------------------------------- потоково, по предложениям
-    def stream_batch(self, transcript: str, new_lines: str) -> AsyncIterator[str]:
+    def stream_batch(self, transcript: str, new_lines: str, note: str = "") -> AsyncIterator[str]:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         heard = [line.split(": ", 1)[1] for line in new_lines.splitlines() if ": " in line]
-        return self._guarded_stream(transcript, self._task_batch(new_lines), max_tokens=80, heard=heard)
+        task = self._task_batch(new_lines) + (f"\n{note}" if note else "")
+        return self._guarded_stream(transcript, task, max_tokens=80, heard=heard)
 
     async def reply_task(self, transcript: str, task: str, max_tokens: int = 100) -> str:
         """Реплика по заданию целиком (нужно, когда ответ сначала проверяем — например, «ПРОПУСК»)."""
