@@ -57,6 +57,11 @@ OWN_CHECK_EVERY_S = 15      # как часто бот прикидывает «
 OWN_LULL_S = 20             # сколько секунд тишины нужно, чтобы самому начать тему
 OWN_MIN_CURIOSITY = 0.6     # только когда очень любопытно
 OWN_CHANCE = 0.35           # и не при каждой возможности
+REPEAT_FRESH_S = 180        # свою реплику помнит дословно столько, потом — только суть
+# «что ты сказал?», «что ты там говорил?», «повтори», «не расслышал» — просят повторить
+REPEAT_ASK = re.compile(r"(?:что|чё|че|шо)\s+ты\s+(?:там\s+|щас\s+|сейчас\s+|только\s+что\s+)?(?:сказал|говорил|спросил|"
+                        r"спрашивал|хотел\s+сказать|имел\s+в\s+виду)|\bповтори(?!\w*\s+за\b)|не\s+(?:рас)?слышал|не\s+расслышали",
+                        re.IGNORECASE)
 
 
 class VoiceSession:
@@ -600,6 +605,28 @@ class VoiceSession:
             log.info("скучает по близким, которых давно нет")
             get_emotions().apply({"sadness": 0.05})
 
+    def _repeat_note(self, lines) -> str:
+        """«А что ты там говорил?» — достаём его прошлую реплику и как хорошо он её помнит:
+        только что — дословно, через несколько минут — только суть; если перебили — догадается, что хотел."""
+        if not any(REPEAT_ASK.search(l.text) for l in lines):
+            return ""
+        first = min(l.seq for l in lines)
+        prev = [l for l in self.buffer.recent(30) if l.is_bot and l.seq < first and l.text not in ("…", "")]
+        if not prev:
+            return ""
+        said = prev[-1].text
+        from bot.brain.life import duration
+
+        age = time.time() - prev[-1].ts
+        if "[меня перебили" in said:
+            said = said.split("…")[0].split("[меня перебили")[0].strip() or "(ничего не успел)"
+            memory = persona.REPEAT_MEMORY["cut"]
+        else:
+            memory = persona.REPEAT_MEMORY["fresh" if age < REPEAT_FRESH_S else "vague"]
+        log.info("просят повторить — вспоминаю: «%s» (%s)", said, "перебили" if "перебили" in memory else
+                 "помню" if age < REPEAT_FRESH_S else "смутно")
+        return persona.REPEAT_NOTE.format(said=said, ago=f"{duration(age)} назад", memory=memory)
+
     def _continues_with_me(self, text: str) -> bool:
         """Реплика явно продолжает разговор с ботом: он только что что-то сказал (особенно спросил),
         и ему отвечают первым же словом, или обращаются на «ты». Сомнительное решает внутренний голос."""
@@ -771,6 +798,7 @@ class VoiceSession:
             return
         transcript = self.buffer.render(self.buffer.recent(12))  # на обращения — небольшой контекст, экономим лимит
         note = ""
+        repeat_note = self._repeat_note(lines)
         mono = get_monologue()
         if mono.active:
             last = mono.session[-1] if mono.session else "о своём"
@@ -783,7 +811,10 @@ class VoiceSession:
             mono.come_out("выдернули")  # зовут настойчиво — выныривает
             note = persona.PULLED_OUT_NOTE.format(thought=last)
         # ответ стримится по предложениям: озвучка стартует, пока модель дописывает остальное
-        await self._speak_stream(self.responder.stream_batch(transcript, self.buffer.render(lines), note=note),
+        if repeat_note:
+            note = f"{note}\n{repeat_note}".strip()
+        await self._speak_stream(self.responder.stream_batch(transcript, self.buffer.render(lines), note=note,
+                                                             allow_repeat=bool(repeat_note)),
                                  proactive=False, utt_end=utt_end)
 
     # ------------------------------------------------------------------ decision

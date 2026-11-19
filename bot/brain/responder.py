@@ -212,12 +212,14 @@ class Responder:
         return await self._generate(transcript, self._task_proactive(topic, angle))
 
     # ---------------------------------------------------------------- потоково, по предложениям
-    def stream_batch(self, transcript: str, new_lines: str, note: str = "") -> AsyncIterator[str]:
+    def stream_batch(self, transcript: str, new_lines: str, note: str = "",
+                     allow_repeat: bool = False) -> AsyncIterator[str]:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         heard = [line.split(": ", 1)[1] for line in new_lines.splitlines() if ": " in line]
         task = self._task_batch(new_lines) + (f"\n{note}" if note else "")
         # +30 токенов на строку мотива (~0.5 с на локальной модели до первого звука)
-        return self._guarded_stream(transcript, task, max_tokens=110, heard=heard, motive=True)
+        return self._guarded_stream(transcript, task, max_tokens=110, heard=heard, motive=True,
+                                    allow_repeat=allow_repeat)
 
     async def reply_task(self, transcript: str, task: str, max_tokens: int = 100) -> str:
         """Реплика по заданию целиком (нужно, когда ответ сначала проверяем — например, «ПРОПУСК»)."""
@@ -240,67 +242,55 @@ class Responder:
         return self._guarded_stream(transcript, self._task_proactive(topic, angle), max_tokens=100)
 
     async def _guarded_stream(self, transcript: str, task: str, max_tokens: int,
-                              heard: list[str] = (), motive: bool = False) -> AsyncIterator[str]:
-        """Поток ответа с защитой от повторов: если первая фраза повторяет недавнюю реплику бота
-        или попугайничает за человеком (heard — что ему только что сказали) — выбрасываем её и генерируем
-        заново с явным запретом; повторы дальше в ответе просто пропускаем."""
+                              heard: list[str] = (), motive: bool = False,
+                              allow_repeat: bool = False) -> AsyncIterator[str]:
+        """Поток ответа с лёгкой защитой от петель (qwen 14b любит долбить одну фразу).
+        Выкидывает только свои дословные/почти дословные повторы. За людьми повторять можно («я не Петер,
+        я Петрик!» — дети так закрепляют). Заново НЕ генерирует (на локальной модели это +10–20 с): если от
+        ответа ничего не осталось, лучше сказать повтор, чем молчать. allow_repeat — его попросили
+        повторить, что он говорил: тогда свои фразы можно."""
         recent = self.recent_lines() if self.recent_lines else []
         greeted = any(re.search(r"\b(привет|здорово|здарова)\b", line.lower()) for line in recent)
-        if len(recent) >= 2 and all("?" in line for line in recent[-2:]):
+        if not allow_repeat and len(recent) >= 2 and all("?" in line for line in recent[-2:]):
             # квота на вопросы: два ответа подряд были вопросами — хватит допрашивать
             task += ("\nВ ЭТОТ РАЗ НЕ ЗАДАВАЙ ВОПРОСОВ: ты и так допрашиваешь людей подряд. "
                      "Ответь утверждением — отреагируй, поделись мыслью, догадкой или тем, что понял.")
         # ремарки в скобках — редко: если в двух последних репликах уже была ремарка, в этой без неё
         no_remarks = any(_REMARK.search(line) for line in recent[-2:])
-        heard_l = list(heard)
 
-        def prepare(sentence: str) -> tuple[str, str | None, bool]:
-            """→ (фраза, на что похожа, это повтор себя (а не эхо за человеком))."""
+        def prepare(sentence: str) -> tuple[str, str | None]:
+            """→ (фраза, на какую свою прошлую она похожа)."""
             s = _tidy(sentence, greeted)
             if no_remarks:
                 s = re.sub(r"\s+([.,!?…])", r"\1", re.sub(r"\s{2,}", " ", _REMARK.sub("", s))).strip()
             if not s or _MOTIVE_START.search(s):  # мотив не вырезался (сломан формат) — вслух не говорим
-                return "", None, False
+                return "", None
             if asks_basic_word(s):
                 log.info("выкидываю вопрос про обычное слово: «%s»", s)
-                return "", None, False
-            own = find_repeat(s, recent)
-            return s, own or find_parrot(s, heard_l), bool(own)
+                return "", None
+            return s, (None if allow_repeat else find_repeat(s, recent))
 
-        # Повторную фразу просто выкидываем и продолжаем тот же ответ — без новой генерации (на локальной
-        # модели это ещё 10–20 с). Заново генерируем, только если от ответа совсем ничего не осталось.
-        for attempt in range(2):
-            gen = self._generate_stream(transcript, task, max_tokens, motive=motive)
-            said_real, pending, bad, own_bad, parrots = False, [], None, False, []
-            async for sentence in gen:
-                s, same, own = prepare(sentence)
-                if same:
-                    bad = bad or same
-                    own_bad = own_bad or own
-                    if not own:
-                        parrots.append(s)
-                    log.info("пропускаю повтор в ответе: «%s» (уже было «%s»)", s, same)
-                    continue
-                if not s:
-                    continue
-                if not _REMARK.sub("", s).strip(" .,!?…"):
-                    pending.append(s)  # одна ремарка без слов — скажем, только если за ней будут слова
-                    continue
-                for r in pending:
-                    yield r
-                pending.clear()
-                said_real = True
-                yield s
-            if said_real or bad is None:
-                return
-            if parrots and not own_bad:
-                # отброшено только «эхо» за человеком (переспрос его же слов) — лучше сказать его,
-                # чем ждать новую генерацию ещё 10–20 с
-                yield parrots[0]
-                return
-            log.info("весь ответ — повтор «%s», придумываю заново", bad)
-            task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{bad}». НЕ повторяй это и не задавай этот вопрос снова "
-                    "(даже другими словами), не повторяй за людьми их слова. Скажи что-то другое по сути.")
+        said_real, pending, skipped = False, [], []
+        async for sentence in self._generate_stream(transcript, task, max_tokens, motive=motive):
+            s, same = prepare(sentence)
+            if same:
+                skipped.append(s)
+                log.info("пропускаю свой повтор: «%s» (уже было «%s»)", s, same)
+                continue
+            if not s:
+                continue
+            if not _REMARK.sub("", s).strip(" .,!?…"):
+                pending.append(s)  # одна ремарка без слов — скажем, только если за ней будут слова
+                continue
+            for r in pending:
+                yield r
+            pending.clear()
+            said_real = True
+            yield s
+        if not said_real and skipped:
+            # весь ответ — повтор: всё равно говорим (раньше тут была новая генерация на 10–20 с и часто «…»)
+            log.info("весь ответ — повтор, но лучше сказать, чем молчать: «%s»", skipped[0])
+            yield skipped[0]
 
     last_motive: str = ""
 
