@@ -76,17 +76,23 @@ fear (тревога: угрожали, пугали, говорили о его
 было интересно), trust (доверие: были добры и честны с ним; обманули или обидели — минус),
 sadness (грусть: игнорировали, обижали, грустные темы). Опирайся на то, что реально произошло.
 
-4) expectations — только если в сообщении есть раздел «Ожидания бота»: для каждого пункта сверь,
-что бот ждал, с тем, что реально было после его реплики. outcome: "match" (в главном так и вышло, даже
-если с подколами), "good" (вышло заметно лучше, чем ждал), "bad" (ждал хорошего, а его проигнорили, обсмеяли, обидели), "miss" (просто не угадал,
-ни хорошо ни плохо). Молчание в ответ — тоже реакция. who — ник того, чья реакция главная (или "").
-what — что было на деле, коротко. Нет раздела — пустой список.
+4) expectations — только если в сообщении есть раздел «Ожидания бота». Для каждого пункта ответь на
+ТРИ отдельных вопроса:
+- answered — отреагировал ли кто-нибудь НА СЛОВА БОТА (ответил ему, посмеялся над его фразой, обругал его)
+  true/false. Если после его реплики молчали или говорили между собой о своём, будто его не было, — false.
+- happened — сбылось ли то, что бот ждал, В ГЛАВНОМ (true/false). Сравнивай только суть ожидания,
+  а не тон: ждал объяснения и ему объяснили (даже с подколом) — true; ждал, что посмеются, и посмеялись — true.
+- nice — насколько реакция людей была приятной для бота: 1 (тепло, похвалили, обрадовались, помогли),
+  0 (обычно, нейтрально, по делу), -1 (обсмеяли зло, обидели, грубо отмахнулись, проигнорили).
+  Дружеский подкол при помощи — это 0, не -1.
+who — ник того, чья реакция главная (или ""). what — что было на деле, коротко.
+Нет раздела — пустой список.
 
 Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "trust": число, "moment": "строка" или null,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
   "world": [{{"text": "факт", "source": "ник", "important": true|false}}],
   "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}},
-  "expectations": [{{"n": номер, "outcome": "match|good|bad|miss", "who": "ник", "what": "строка"}}]}}"""
+  "expectations": [{{"n": номер, "answered": true|false, "happened": true|false, "nice": -1|0|1, "who": "ник", "what": "строка"}}]}}"""
 
 
 @dataclass
@@ -329,6 +335,39 @@ def _match_name(name: str, humans: dict[str, int | None]) -> str | None:
     return None
 
 
+def _flag(v) -> bool | None:
+    if isinstance(v, str):
+        v = v.strip().lower()
+        return True if v in ("true", "да", "yes", "1") else False if v in ("false", "нет", "no", "0") else None
+    return v if isinstance(v, bool) else None
+
+
+# ожидание «меня проигнорят», «никто не ответит», «промолчат» — его сбытие проверяем по факту, а не словами
+_EXPECT_IGNORED = re.compile(r"проигнор|игнор|не ответ|не отреаг|промолч|не заметят|никто|не услыш", re.I)
+
+
+def _outcome(r: dict, expect: str = "") -> str | None:
+    """Итог сверки считаем сами из простых ответов — модели не надо выбирать между похожими словами.
+    сбылось → match; не сбылось и приятно → good; не сбылось и неприятно → bad; иначе miss.
+    Игнор проверяем по факту «ответил ли боту хоть кто-то»: модель путается, когда люди говорят о своём."""
+    happened, answered = _flag(r.get("happened")), _flag(r.get("answered"))
+    try:
+        nice = int(round(float(r.get("nice") or 0)))
+    except (TypeError, ValueError):
+        nice = 0
+    if answered is not None:
+        if _EXPECT_IGNORED.search(expect):
+            happened = not answered
+        elif not answered:
+            happened = False   # ждал ответа/реакции, а ему никто не ответил
+            nice = min(nice, -1)  # проигнорили — неприятно
+    if happened is None:
+        return None
+    if happened:
+        return "match"
+    return "good" if nice > 0 else "bad" if nice < 0 else "miss"
+
+
 def _apply_expectations(store: "RelationsStore", exps: list, results, humans: dict) -> None:
     """Сверка «ждал — получил»: слабо двигает чувства и доверие к тому, кто удивил."""
     from bot.brain.predict import EFFECT, PERSON_TRUST, get_predictor
@@ -343,8 +382,8 @@ def _apply_expectations(store: "RelationsStore", exps: list, results, humans: di
             e, _ = exps[int(r.get("n", 0)) - 1]
         except (ValueError, TypeError, IndexError):
             continue
-        outcome = str(r.get("outcome", "")).lower()
-        if outcome not in EFFECT:
+        outcome = _outcome(r, e.expect)
+        if outcome is None:
             continue
         what = str(r.get("what") or "")
         pred.resolve(e, outcome, what)
