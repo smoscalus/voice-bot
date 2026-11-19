@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import random
+import re
 import logging
 import time
 
@@ -32,13 +33,13 @@ from bot.brain.emotions import get_emotions
 from bot.brain.knowledge import get_knowledge
 from bot.brain.life import bury, dream, get_life, write_epitaph
 from bot.brain import book
-from bot.brain.llm import LLMRouter
+from bot.brain.llm import LLMRouter, foreground
 from bot.brain.relations import RelationsJudge, get_store
 from bot.brain.self_model import get_self_model
 from bot.brain.policy import SpeakPolicy
 from bot.brain.responder import Responder
 from bot.brain.transcript import TranscriptBuffer
-from bot.brain.triggers import TriggerDetector, voice_command
+from bot.brain.triggers import _SECOND_PERSON, TriggerDetector, voice_command
 from bot.config import Settings
 from bot.stt.base import STTEngine, clean_transcript
 
@@ -127,8 +128,11 @@ class VoiceSession:
         fallbacks = settings.llm_fallback_models
         t = settings.llm_timeout_s
         light_llm = LLMRouter(client, [settings.classifier_model, *fallbacks], settings.reasoning_effort, t)
+        self.light_llm = light_llm
+        # память, дневник, книжка, сны — фоном: уступают очередь живому ответу (локальная модель одна на всё)
         memory_llm = LLMRouter(client, [settings.memory_model, settings.classifier_model, *fallbacks],
-                               settings.reasoning_effort, t)
+                               settings.reasoning_effort, max(t, 60), background=True,
+                               preemptible=settings.provider == "local")
         self.classifier = InterestClassifier(light_llm, persona.BOT_NAME, persona.INTERVENE_RULES)
         if hasattr(self, "judge"):
             self.judge.llm = memory_llm
@@ -185,8 +189,9 @@ class VoiceSession:
         participants = {l.speaker: l.speaker_id for l in self.buffer.recent(30) if not l.is_bot}
         query = " ".join(l.text for l in self.buffer.recent(6))  # о чём сейчас речь — что из памяти вспомнить
         chat = "Сейчас люди разговаривают между собой, не с тобой." if self._people_chatting() else ""
-        blocks = [get_life().prompt_block(), get_knowledge().prompt_block(query), self.self_model.prompt_block(),
-                  self.relations.prompt_block(participants), self.drive.prompt_block(),
+        # редко меняющееся — в начало: локальная модель не пересчитывает одинаковое начало промпта
+        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants),
+                  get_knowledge().prompt_block(query), get_life().prompt_block(), self.drive.prompt_block(),
                   get_emotions().prompt_block(), chat, self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
@@ -370,9 +375,17 @@ class VoiceSession:
                 self.policy.open_attention(utt.user_id)
                 self._spawn(self._answer_if_no_followup(utt.user_id, utt_end))
                 return
+            if book.per_day() > 0 and book.READ_REQUEST.search(text):
+                self._spawn(self._read_book_asked(text, utt_end))  # «Петрык, почитай в книжке про Крым»
+                return
             self._request_reply(utt_end)
             return
         if self.policy.take_attention(utt.user_id):
+            self._request_reply(utt_end)
+            return
+        # 1б) продолжение разговора с ним без имени: он только что спросил — ему отвечают, или говорят «ты…»
+        #     Раньше это шло через «внутренний голос» (лишний заход к модели, +10–15 с на локальной) — теперь сразу.
+        if self._continues_with_me(text):
             self._request_reply(utt_end)
             return
 
@@ -440,8 +453,8 @@ class VoiceSession:
         elif life.dream_pending and self.segmenter.seconds_since_last_voice() > 120:
             self._life_busy = True  # в войсе тихо пару минут — задремал
             self._spawn(self._dream())
-        elif self.segmenter.seconds_since_last_voice() > 60 and book.due():
-            self._life_busy = True  # затишье, а ему так и не объяснили — читает сам
+        elif self.segmenter.seconds_since_last_voice() > 25 and book.due():
+            self._life_busy = True  # короткое затишье, а ему так и не объяснили — читает сам (фоном)
             self._spawn(self._read_book())
 
     def _mute(self, who: str) -> None:
@@ -475,6 +488,26 @@ class VoiceSession:
             self._unmuting = False
             self._life_busy = False
 
+    def _continues_with_me(self, text: str) -> bool:
+        """Реплика явно продолжает разговор с ботом: он только что что-то сказал (особенно спросил),
+        и ему отвечают первым же словом, или обращаются на «ты». Сомнительное решает внутренний голос."""
+        if not self.policy.in_follow_up() or self._people_chatting():
+            return False
+        lines = self.buffer.recent(4)
+        bot_i = max((i for i, l in enumerate(lines) if l.is_bot), default=None)
+        if bot_i is None:
+            return False
+        after = [l for l in lines[bot_i + 1:] if not l.is_bot]
+        if len(after) != 1:  # отвечают ему сразу; если уже двое заговорили после него — пусть решает классификатор
+            return False
+        words = set(re.findall(r"[\w-]+", text.lower().replace("ё", "е")))
+        others = {n.lower().split()[0] for n in (l.speaker for l in self.buffer.recent(20) if not l.is_bot) if n}
+        if words & others:
+            return False  # «Петя, ты как?» — к другому человеку
+        asked = "?" in lines[bot_i].text
+        second = bool(words & _SECOND_PERSON)
+        return asked or second
+
     def _people_chatting(self) -> bool:
         """Люди говорят между собой: последние реплики — от разных людей, бот в них не участвует
         и к нему давно не обращались."""
@@ -501,6 +534,33 @@ class VoiceSession:
             await book.read_one(self.judge.llm)
         except Exception:
             log.exception("книжка: ошибка")
+        finally:
+            self._life_busy = False
+
+    async def _read_book_asked(self, text: str, utt_end: float) -> None:
+        """Попросили почитать — читает сразу (про что сказали или про то, что сам спрашивал) и рассказывает."""
+        if self._life_busy:
+            self._request_reply(utt_end)
+            return
+        self._life_busy = True
+        try:
+            with foreground():
+                if self.sfx and (clip := self.sfx.random("back")):
+                    self._spawn(self._play_clip(clip))  # «угу» — понял, читает
+                try:
+                    res = await book.read_one(self.light_llm, book.requested_term(text), asked=True)
+                except Exception:
+                    log.exception("книжка: ошибка")
+                    res = None
+            if res is None:  # читать нечего — просто отвечает
+                self._request_reply(utt_end)
+                return
+            term, facts = res
+            task = (persona.BOOK_TELL_TASK.format(term=term, facts="; ".join(facts)) if facts
+                    else persona.BOOK_NOTHING_TASK.format(term=term))
+            await self._speak_stream(
+                self.responder.stream_task(self.buffer.render(self.buffer.recent(12)), task, max_tokens=120),
+                proactive=False, utt_end=utt_end)
         finally:
             self._life_busy = False
 
@@ -576,6 +636,10 @@ class VoiceSession:
         self._reply_task = self._spawn(self._reply_batch(utt_end, prev))
 
     async def _reply_batch(self, utt_end: float, prev: asyncio.Task | None = None) -> None:
+        with foreground():  # пока собираем пачку и отвечаем — фоновые дела ждут
+            await self._reply_batch_inner(utt_end, prev)
+
+    async def _reply_batch_inner(self, utt_end: float, prev: asyncio.Task | None = None) -> None:
         self._collecting = True  # пока ждём — новые обращения вливаются в эту же пачку
         if prev is not None:
             await asyncio.wait({prev})  # ждём, пока договорит прошлый ответ; потом ответим только на новое
@@ -657,7 +721,8 @@ class VoiceSession:
             self._returning.clear()
         transcript = self.buffer.render(self.buffer.recent(12))
         memory = self._relations_context()  # знания, цели и планы людей — повод спросить
-        verdict = await self.classifier.evaluate(transcript, hint + ("\n\n" + memory if memory else ""))
+        with foreground():
+            verdict = await self.classifier.evaluate(transcript, hint + ("\n\n" + memory if memory else ""))
         log.info("verdict: %s", verdict)
         if self._reply_busy() or self._last_bot_seq != seq0:
             return  # пока думали, бот уже ответил — второй раз не лезем
@@ -775,6 +840,10 @@ class VoiceSession:
             return  # попросили помолчать — ни слова (кроме реакции на «можешь говорить»)
         # Свою же реплику не обрываем новым ответом: он подождёт очереди (_speak_lock).
         # Перебить бота можно голосом (barge-in) или стоп-словом.
+        with foreground():
+            await self._speak_stream_inner(sentences, proactive=proactive, utt_end=utt_end)
+
+    async def _speak_stream_inner(self, sentences, *, proactive: bool, utt_end: float | None = None) -> None:
         async with self._speak_lock:
             line = self.buffer.add(persona.BOT_NAME, "…", is_bot=True)
             self._last_bot_seq = line.seq

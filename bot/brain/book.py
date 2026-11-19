@@ -40,6 +40,28 @@ def per_day() -> int:
         return 10
 
 
+# «прочитай в книжке», «посмотри в интернете», «загугли» — просьба почитать прямо сейчас
+READ_REQUEST = re.compile(r"\b(?:почитай|прочитай|прочти|загугли|погугли)\w*|\b(?:посмотри|глянь|поищи|найди)\w*\s+(?:в|на)\s+(?:книжк|интернет|вики|гугл)", re.I)
+_ABOUT = re.compile(r"(?<!\w)(?:про|об?|насчет|насчёт)\s+[\"«'„]?([^?\"»'.,!()]{2,40})", re.I)
+_PRONOUN_START = re.compile(r"^(?:шо|чо|че|чё|ты|вы|он|она|они|я|мы|это|этот|эта|эти|тот|там|тут|меня|тебя|него)\b", re.I)
+
+
+def worth_reading(term: str) -> bool:
+    """Мусор в «хочу узнать» не кладём: своё имя, междометия, обычные слова, обрывки фраз."""
+    from bot import persona
+    from bot.brain.triggers import TriggerDetector, normalize
+
+    t = normalize(term)
+    if len(t) < 3 or len(t.split()) > 4 or _PRONOUN_START.match(t):
+        return False
+    words = t.split()
+    detector = TriggerDetector(persona.WAKE_WORDS, [], [], {}, [], [])
+    if any(detector._is_wake_token(w) for w in words):
+        return False  # «Петрик», «Петер» — это он сам
+    basic = {part[:5] for w in getattr(persona, "BASIC_WORDS", []) for part in normalize(w).split()}
+    return not all(w[:5] in basic or len(w) <= 2 for w in words)
+
+
 def note_questions(text: str) -> None:
     """Бот что-то спросил — запоминаем, что ему интересно (прочитает, если не ответят)."""
     from bot.brain.knowledge import get_knowledge
@@ -47,8 +69,17 @@ def note_questions(text: str) -> None:
     for m in _QUESTION.finditer(text or ""):
         term = re.sub(r"\s+", " ", m.group(1)).strip(" -—")
         term = re.sub(r"^(это|эти|этот|эта)\s+", "", term, flags=re.I)
-        if 2 <= len(term) <= 40 and len(term.split()) <= 4:
+        if 2 <= len(term) <= 40 and worth_reading(term):
             get_knowledge().add_curious(term)
+
+
+def requested_term(text: str) -> str | None:
+    """«Петрык, почитай в книжке про Крым» → «Крым». Без «про …» — None (возьмём то, что он сам спрашивал)."""
+    m = _ABOUT.search(text or "") or _QUESTION.search(text or "")  # «…посмотри, что такое токен»
+    if not m:
+        return None
+    term = re.sub(r"\s+(?:в|из)\s+(?:книжк\w*|интернет\w*|википеди\w*).*$", "", m.group(1), flags=re.I).strip(" -—")
+    return term if worth_reading(term) else None
 
 
 def due() -> bool:
@@ -100,27 +131,33 @@ async def _fetch(term: str) -> tuple[str, str] | None:
     return await asyncio.to_thread(_fetch_sync, term)
 
 
-async def read_one(llm) -> list[str]:
-    """Прочитать про одну непонятую вещь. Возвращает, что он вынес из книжки."""
+async def read_one(llm, term: str | None = None, asked: bool = False) -> tuple[str, list[str]] | None:
+    """Прочитать про одну непонятую вещь (или про term — если попросили). Возвращает (о чём, что вынес)."""
     from bot import persona
     from bot.brain.knowledge import get_knowledge
 
     k = get_knowledge()
-    item = k.next_curious(WAIT_ANSWER_S)
-    if item is None:
-        return []
-    item["tried"] = True
+    if term is None:
+        # попросили почитать без «про что» — берёт то, о чём сам спрашивал последним, не дожидаясь
+        item = k.latest_curious() if asked else k.next_curious(WAIT_ANSWER_S)
+        if item is None:
+            return None
+        item["tried"] = True
+        term = item["term"]
+    else:
+        for c in k.curious:
+            if c["term"].lower() == term.lower():
+                c["tried"] = True
     k.reads.append(time.time())
     k.save()
-    term = item["term"]
     try:
         found = await _fetch(term)
     except Exception as e:
         log.warning("книжка: не смог прочитать про «%s»: %s", term, e)
-        return []
+        return term, []
     if not found:
         log.info("книжка: про «%s» ничего не нашёл", term)
-        return []
+        return term, []
     title, text = found
     try:
         resp = await llm.create(
@@ -132,11 +169,11 @@ async def read_one(llm) -> list[str]:
                  if str(f).strip()][:3]
     except Exception as e:
         log.warning("книжка: не понял прочитанное про «%s»: %s", term, e)
-        return []
+        return term, []
     added = k.add([(f, SOURCE, False) for f in facts])
     log.info("книжка: прочитал про «%s» (%s): %s", term, title, "; ".join(facts) if facts else "ничего не понял")
     if added:
         from bot.brain.drive import get_drive
 
         get_drive().on_learned(added)
-    return facts
+    return term, facts

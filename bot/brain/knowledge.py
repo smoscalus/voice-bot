@@ -181,16 +181,31 @@ class Knowledge:
         self._dirty = True
         log.info("хочу узнать: %s", term)
 
+    def _still_unknown(self, c: dict) -> bool:
+        """Ещё не знает и стоит почитать. Объяснили, пока ждал, или это мусор («шо ты», своё имя) — вычёркиваем."""
+        from bot.brain.book import worth_reading
+
+        if c.get("tried"):
+            return False
+        if self.knows(c["term"]) or not worth_reading(c["term"]):
+            c["tried"] = True
+            self._dirty = True
+            return False
+        return True
+
     def next_curious(self, wait_s: float) -> dict | None:
         now = time.time()
         for c in self.curious:
-            if c.get("tried") or now - c.get("ts", now) < wait_s:
-                continue
-            if self.knows(c["term"]):  # пока ждал — ему объяснили
-                c["tried"] = True
-                self._dirty = True
-                continue
-            return c
+            if now - c.get("ts", now) >= wait_s and self._still_unknown(c):
+                return c
+        return None
+
+    def latest_curious(self) -> dict | None:
+        """О чём спрашивал последним и так и не узнал (за последний час)."""
+        now = time.time()
+        for c in reversed(self.curious):
+            if now - c.get("ts", now) < 3600 and self._still_unknown(c):
+                return c
         return None
 
     # ---------------------------------------------------------------- сон: тускнение

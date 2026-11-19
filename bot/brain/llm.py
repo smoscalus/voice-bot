@@ -5,6 +5,8 @@ qwen → gpt-oss-120b → gpt-oss-20b даёт в разы больше бесп
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -33,9 +35,49 @@ def _retry_after(err: Exception) -> float:
     return h * 3600 + mnt * 60 + s + 1
 
 
+# ---------------------------------------------------------------- живой ответ важнее фоновых дел
+# Локальная модель (Ollama) делает одно дело за раз: пока летописец пишет досье (10–20 с), ответ человеку
+# стоит в очереди. Поэтому фоновые вызовы (память, дневник, книжка, сны) ждут, пока бот не отвечает,
+# а если ответ понадобился посреди фонового вызова — фоновый обрывается и повторяется позже.
+_fg_count = 0
+_fg_idle_since = 0.0
+_bg_inflight: set[asyncio.Task] = set()
+BG_IDLE_GAP_S = 2.5     # после ответа даём паузу — вдруг человек сразу ответит
+BG_MAX_WAIT_S = 120     # дольше не ждём: память тоже нужна
+BG_MAX_PREEMPT = 3      # столько раз фоновый вызов уступает, потом доделывается без уступок
+
+
+@contextlib.contextmanager
+def foreground():
+    """Бот сейчас отвечает человеку: фоновые вызовы ждут, а начатые — обрываются (только локальная модель)."""
+    global _fg_count, _fg_idle_since
+    _fg_count += 1
+    for t in list(_bg_inflight):
+        t.cancel()
+    try:
+        yield
+    finally:
+        _fg_count -= 1
+        if _fg_count <= 0:
+            _fg_count = 0
+            _fg_idle_since = time.monotonic()
+
+
+def foreground_busy() -> bool:
+    return _fg_count > 0 or time.monotonic() - _fg_idle_since < BG_IDLE_GAP_S
+
+
+async def _wait_turn() -> None:
+    deadline = time.monotonic() + BG_MAX_WAIT_S
+    while foreground_busy() and time.monotonic() < deadline:
+        await asyncio.sleep(0.3)
+
+
 class LLMRouter:
     def __init__(self, client: AsyncOpenAI, models: list[str], reasoning_effort: str | None,
-                 timeout: float = 12.0):
+                 timeout: float = 12.0, background: bool = False, preemptible: bool = False):
+        self.background = background      # фоновые дела: ждут, пока бот не отвечает людям
+        self.preemptible = preemptible    # и обрываются, если ответ понадобился (имеет смысл для Ollama)
         self.client = client
         self.models = [m for i, m in enumerate(models) if m and m not in models[:i]]
         self.reasoning_effort = reasoning_effort
@@ -43,7 +85,28 @@ class LLMRouter:
         self.timeout = timeout
 
     async def create(self, **kwargs):
-        """То же, что client.chat.completions.create, но с перебором моделей при 429."""
+        """То же, что client.chat.completions.create, но с перебором моделей при 429.
+        Фоновый роутер сначала ждёт своей очереди (см. foreground)."""
+        if not self.background:
+            return await self._create(**kwargs)
+        for attempt in range(BG_MAX_PREEMPT + 1):
+            await _wait_turn()
+            task = asyncio.ensure_future(self._create(**kwargs))
+            if self.preemptible and attempt < BG_MAX_PREEMPT:
+                _bg_inflight.add(task)
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            finally:
+                _bg_inflight.discard(task)
+            if not task.cancelled():
+                return task.result()
+            log.info("фоновое дело уступило живому ответу — доделаю позже")
+        raise RuntimeError("фоновое дело так и не дождалось очереди")
+
+    async def _create(self, **kwargs):
         now = time.monotonic()
         available = [m for m in self.models if self._blocked_until.get(m, 0) <= now] or self.models[-1:]
         last_err: Exception | None = None

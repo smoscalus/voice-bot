@@ -39,8 +39,13 @@ def _junk_word(m: re.Match) -> str:
     return " " if glued or camel else w
 
 
+def _unwrap_speech(m: re.Match) -> str:
+    inner = m.group(1)
+    return f" {inner} " if "?" in inner or len(inner.split()) >= 6 else m.group(0)
+
+
 def _clean(text: str) -> str:
-    text = _UNCLEAR_MARK.sub("", text)
+    text = re.sub(r"\(([^)]{1,200})\)", _unwrap_speech, _UNCLEAR_MARK.sub("", text))
     text = _LATIN_WORD.sub(_junk_word, _JUNK.sub(" ", text))
     text = _STARS.sub(r"(\1)", _EMOJI.sub("", _CJK.sub("", text)))
     return re.sub(r"\s{2,}", " ", text).strip()
@@ -68,30 +73,52 @@ def _norm_for_repeat(text: str) -> str:
     return " ".join(w[:5] for w in t.split())
 
 
+# слова-«каркас» вопросов и неуверенности: «что такое X», «я не уверен, что значит X», «можно объяснить X» —
+# одинаковый каркас ещё не повтор, сравниваем то, О ЧЁМ фраза (иначе «что такое фейерверк?» = «что такое мем?»)
+_FRAME = {"такое", "такой", "такая", "значи", "означ", "можно", "может", "объяс", "поним", "понял", "понят",
+          "знаю", "знаеш", "увере", "интер", "кажет", "думаю", "хочу", "хотел", "слово", "слова", "совсе",
+          "точно", "немно", "очень", "всё", "все", "ещё", "было", "есть", "быть", "будет", "меня", "мой",
+          "моё", "мое", "мои", "моя", "это", "этот", "эта", "эти", "кто", "где", "когда", "почем", "зачем",
+          "или", "если", "чем", "тоже", "просто", "бы", "нет", "ага", "угу", "вы", "вас", "вам"}
+
+
+_LOST = re.compile(r"не\s+(?:совсем\s+|очень\s+)?(?:понимаю|понял|пойму|ясно)[^.!?]{0,25}о\s+ч[её]м", re.I)
+
+
+def _content(norm: str) -> list[str]:
+    return [w for w in norm.split() if w not in _STOP and w not in _FRAME]
+
+
 def find_repeat(sentence: str, recent: list[str], threshold: int = 80) -> str | None:
-    """Если фраза повторяет (почти дословно или по смыслу набора слов) что-то из недавних реплик — вернёт ту фразу.
-    Короткие ответы («нормально», «не знаю») повторами не считаем — это норма."""
+    """Если фраза повторяет (почти дословно или по смыслу) что-то из недавних реплик — вернёт ту фразу.
+    Короткие ответы («нормально», «не знаю») повторами не считаем — это норма. Сравниваем суть
+    (смысловые слова), а не каркас: новый вопрос про другое слово — не повтор."""
     from rapidfuzz import fuzz
 
     s = _norm_for_repeat(sentence)
+    if _LOST.search(sentence):  # «не понимаю, о чём вы говорите» — второй раз подряд не надо
+        for line in recent:
+            if m := _LOST.search(line):
+                return m.group(0)
     if len(s.split()) >= 2:  # короткое, но дословно то же («привет, как дела?» по кругу) — тоже повтор
         for line in recent:
             for old in re.split(r"(?<=[.!?…])\s+", line):
                 if s == _norm_for_repeat(old):
                     return old.strip()
-    s_words = set(s.split()) - _STOP
-    if len(s.split()) < 3 or not s_words:
+    s_words = set(_content(s))
+    if len(s.split()) < 3 or len(s_words) < 2:
         return None
+    s_c = " ".join(_content(s))
     for line in recent:
         for old in re.split(r"(?<=[.!?…])\s+", line):
-            o = _norm_for_repeat(old)
-            o_words = set(o.split()) - _STOP
+            o_list = _content(_norm_for_repeat(old))
+            o_words = set(o_list)
             if len(o_words) < 2:  # «не знаю», «нормально» — не считаем
                 continue
             same = s_words & o_words
-            # тот же вопрос другими словами: почти все смысловые слова старой фразы есть в новой
+            # тот же смысл другими словами: почти все смысловые слова одной фразы есть в другой
             by_meaning = len(same) >= 2 and len(same) / min(len(s_words), len(o_words)) >= 0.75
-            if by_meaning or fuzz.ratio(s, o) >= threshold - 5:
+            if by_meaning or (len(s_c) >= 10 and fuzz.ratio(s_c, " ".join(o_list)) >= threshold + 5):
                 return old.strip()
     return None
 
@@ -107,7 +134,7 @@ def find_parrot(sentence: str, heard: list[str]) -> str | None:
     return find_repeat(sentence, heard)
 
 
-_SELF_ADDRESS = re.compile(rf"^\s*{persona.BOT_NAME}\s*[,!.:]\s*", re.IGNORECASE)
+_SELF_ADDRESS = re.compile(r"^\s*(?:п[еэаь]?т(?:р[иыеэ]к|ер|р)\w{0,2})\s*[,!.:]\s*", re.IGNORECASE)
 _NAME_GREETING_ONLY = re.compile(r"^\s*[^,.!?]{1,30},\s*(привет|здорово|здарова|хай)\s*[.!]*\s*$", re.IGNORECASE)
 _LEADING_GREETING = re.compile(r"^\s*(привет|здорово|здарова|хай)\s*[,!.]?\s*", re.IGNORECASE)
 
@@ -121,6 +148,25 @@ def _tidy(sentence: str, greeted: bool) -> str:
         s = _LEADING_GREETING.sub("", s)
     s = s.strip()
     return (s[0].upper() + s[1:]) if s else s
+
+
+_ASK_WORD = re.compile(r"(?:что|чё|че)\s+(?:такое|значит|означает)\s+[«\"'„]?([\w-]+)[»\"'“]?\s*[?.!…]*\s*$",
+                       re.IGNORECASE)
+
+
+def _basic_stems() -> set[str]:
+    return {part[:5] for w in getattr(persona, "BASIC_WORDS", [])
+            for part in w.lower().replace("ё", "е").replace("-", " ").split()}
+
+
+def asks_basic_word(sentence: str) -> bool:
+    """«А что значит врать?», «Что такое да-да-да?» — обычные слова он знает с рождения."""
+    m = _ASK_WORD.search(sentence.strip())
+    if not m:
+        return False
+    word = m.group(1).lower().replace("ё", "е")
+    parts = word.split("-")
+    return word in {"что", "это", "так", "да", "нет"} or all(p[:5] in _basic_stems() for p in parts if p)
 
 
 class Responder:
@@ -200,23 +246,31 @@ class Responder:
         no_remarks = any(_REMARK.search(line) for line in recent[-2:])
         heard_l = list(heard)
 
-        def prepare(sentence: str) -> tuple[str, str | None]:
+        def prepare(sentence: str) -> tuple[str, str | None, bool]:
+            """→ (фраза, на что похожа, это повтор себя (а не эхо за человеком))."""
             s = _tidy(sentence, greeted)
             if no_remarks:
                 s = re.sub(r"\s+([.,!?…])", r"\1", re.sub(r"\s{2,}", " ", _REMARK.sub("", s))).strip()
             if not s:
-                return "", None
-            return s, find_repeat(s, recent) or find_parrot(s, heard_l)
+                return "", None, False
+            if asks_basic_word(s):
+                log.info("выкидываю вопрос про обычное слово: «%s»", s)
+                return "", None, False
+            own = find_repeat(s, recent)
+            return s, own or find_parrot(s, heard_l), bool(own)
 
         # Повторную фразу просто выкидываем и продолжаем тот же ответ — без новой генерации (на локальной
         # модели это ещё 10–20 с). Заново генерируем, только если от ответа совсем ничего не осталось.
         for attempt in range(2):
             gen = self._generate_stream(transcript, task, max_tokens)
-            said_real, pending, bad = False, [], None
+            said_real, pending, bad, own_bad, parrots = False, [], None, False, []
             async for sentence in gen:
-                s, same = prepare(sentence)
+                s, same, own = prepare(sentence)
                 if same:
                     bad = bad or same
+                    own_bad = own_bad or own
+                    if not own:
+                        parrots.append(s)
                     log.info("пропускаю повтор в ответе: «%s» (уже было «%s»)", s, same)
                     continue
                 if not s:
@@ -230,6 +284,11 @@ class Responder:
                 said_real = True
                 yield s
             if said_real or bad is None:
+                return
+            if parrots and not own_bad:
+                # отброшено только «эхо» за человеком (переспрос его же слов) — лучше сказать его,
+                # чем ждать новую генерацию ещё 10–20 с
+                yield parrots[0]
                 return
             log.info("весь ответ — повтор «%s», придумываю заново", bad)
             task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{bad}». НЕ повторяй это и не задавай этот вопрос снова "
