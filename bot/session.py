@@ -39,6 +39,7 @@ from bot.brain.self_model import get_self_model
 from bot.brain.policy import SpeakPolicy
 from bot.brain.predict import get_predictor
 from bot.brain.monologue import get_monologue
+from bot.brain.habits import get_habits
 from bot.brain.responder import Responder
 from bot.brain.transcript import TranscriptBuffer
 from bot.brain.triggers import _SECOND_PERSON, TriggerDetector, voice_command
@@ -201,7 +202,8 @@ class VoiceSession:
         query = " ".join(l.text for l in self.buffer.recent(6))  # о чём сейчас речь — что из памяти вспомнить
         chat = "Сейчас люди разговаривают между собой, не с тобой." if self._people_chatting() else ""
         # редко меняющееся — в начало: локальная модель не пересчитывает одинаковое начало промпта
-        blocks = [self.self_model.prompt_block(), self.relations.prompt_block(participants, active),
+        blocks = [self.self_model.prompt_block(), get_habits().prompt_block(),
+                  self.relations.prompt_block(participants, active),
                   get_knowledge().prompt_block(query), get_life().prompt_block(), self.drive.prompt_block(),
                   get_emotions().prompt_block(), get_predictor().prompt_block(), get_monologue().prompt_block(),
                   chat, self._my_lines_block()]
@@ -1001,6 +1003,7 @@ class VoiceSession:
                 if text and not cut:
                     self._my_lines.append(text)
                     book.note_questions(text)  # о чём спросил — прочитает в книжке, если не ответят
+                    get_habits().note_said(text)  # использованные словечки крепнут
                     if expect:
                         get_predictor().add(text, expect, line.seq)  # потом сверит, как отреагировали
                 if not text:

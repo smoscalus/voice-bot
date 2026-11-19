@@ -169,6 +169,11 @@ def asks_basic_word(sentence: str) -> bool:
     return word in {"что", "это", "так", "да", "нет"} or all(p[:5] in _basic_stems() for p in parts if p)
 
 
+# «МОТИВ: Вася прикалывается» — первая строка прямого ответа; до озвучки вырезается
+_MOTIVE_START = re.compile(r"мотив\s*:", re.I)
+_MOTIVE_LINE = re.compile(r"мотив\s*:\s*([^\n]*?)\s*(?:\n+|(?<=[.!?])\s+(?=[А-ЯЁA-Z(«]))", re.I)
+
+
 class Responder:
     def __init__(self, llm: LLMRouter, system_prompt: str, extra_context=None, recent_lines=None):
         self.llm = llm
@@ -188,7 +193,8 @@ class Responder:
             f"С твоего последнего ответа в чате сказали:\n{new_lines}\n\n"
             f"{persona.DIRECT_TASK} "
             "Реплики, обращённые не к тебе, — просто контекст. "
-            "Если твою прошлую реплику перебили — не повторяй её."
+            "Если твою прошлую реплику перебили — не повторяй её.\n"
+            f"{persona.MOTIVE_RULE}"
         )
 
     @staticmethod
@@ -210,7 +216,8 @@ class Responder:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         heard = [line.split(": ", 1)[1] for line in new_lines.splitlines() if ": " in line]
         task = self._task_batch(new_lines) + (f"\n{note}" if note else "")
-        return self._guarded_stream(transcript, task, max_tokens=80, heard=heard)
+        # +30 токенов на строку мотива (~0.5 с на локальной модели до первого звука)
+        return self._guarded_stream(transcript, task, max_tokens=110, heard=heard, motive=True)
 
     async def reply_task(self, transcript: str, task: str, max_tokens: int = 100) -> str:
         """Реплика по заданию целиком (нужно, когда ответ сначала проверяем — например, «ПРОПУСК»)."""
@@ -233,7 +240,7 @@ class Responder:
         return self._guarded_stream(transcript, self._task_proactive(topic, angle), max_tokens=100)
 
     async def _guarded_stream(self, transcript: str, task: str, max_tokens: int,
-                              heard: list[str] = ()) -> AsyncIterator[str]:
+                              heard: list[str] = (), motive: bool = False) -> AsyncIterator[str]:
         """Поток ответа с защитой от повторов: если первая фраза повторяет недавнюю реплику бота
         или попугайничает за человеком (heard — что ему только что сказали) — выбрасываем её и генерируем
         заново с явным запретом; повторы дальше в ответе просто пропускаем."""
@@ -252,7 +259,7 @@ class Responder:
             s = _tidy(sentence, greeted)
             if no_remarks:
                 s = re.sub(r"\s+([.,!?…])", r"\1", re.sub(r"\s{2,}", " ", _REMARK.sub("", s))).strip()
-            if not s:
+            if not s or _MOTIVE_START.search(s):  # мотив не вырезался (сломан формат) — вслух не говорим
                 return "", None, False
             if asks_basic_word(s):
                 log.info("выкидываю вопрос про обычное слово: «%s»", s)
@@ -263,7 +270,7 @@ class Responder:
         # Повторную фразу просто выкидываем и продолжаем тот же ответ — без новой генерации (на локальной
         # модели это ещё 10–20 с). Заново генерируем, только если от ответа совсем ничего не осталось.
         for attempt in range(2):
-            gen = self._generate_stream(transcript, task, max_tokens)
+            gen = self._generate_stream(transcript, task, max_tokens, motive=motive)
             said_real, pending, bad, own_bad, parrots = False, [], None, False, []
             async for sentence in gen:
                 s, same, own = prepare(sentence)
@@ -295,6 +302,23 @@ class Responder:
             task = (f"{task}\nВНИМАНИЕ: ты уже говорил «{bad}». НЕ повторяй это и не задавай этот вопрос снова "
                     "(даже другими словами), не повторяй за людьми их слова. Скажи что-то другое по сути.")
 
+    last_motive: str = ""
+
+    def _take_motive(self, buf: str) -> tuple[str, bool]:
+        """Отрезает «МОТИВ: …» в начале ответа. → (остаток, ждать ли ещё)."""
+        head = buf.lstrip()
+        if not head:
+            return buf, True
+        if not _MOTIVE_START.match(head):
+            # модель не написала мотив — ничего не вырезаем (если начало ещё может им стать — подождём)
+            return (buf, True) if len(head) < 6 and "МОТИВ".startswith(head.upper()) else (buf, False)
+        m = _MOTIVE_LINE.match(head)
+        if not m:
+            return buf, len(head) < 300  # ждём конца строки (страховка: длинная «строка» — не мотив)
+        self.last_motive = m.group(1).strip()[:150]
+        log.info("🤔 мотив: %s", self.last_motive)
+        return head[m.end():], False
+
     def _messages(self, transcript: str, task: str) -> list[dict]:
         system = self.system_prompt
         if self.extra_context and (extra := self.extra_context()):
@@ -311,8 +335,11 @@ class Responder:
         )
         return _clean(resp.choices[0].message.content or "")
 
-    async def _generate_stream(self, transcript: str, task: str, max_tokens: int = 100) -> AsyncIterator[str]:
-        """Выдаёт ответ по предложениям по мере генерации — озвучка стартует с первого же."""
+    async def _generate_stream(self, transcript: str, task: str, max_tokens: int = 100,
+                               motive: bool = False) -> AsyncIterator[str]:
+        """Выдаёт ответ по предложениям по мере генерации — озвучка стартует с первого же.
+        motive=True: модель сначала пишет строку «МОТИВ: …» (зачем, по её мнению, человек это сказал) —
+        её вырезаем до озвучки, пишем в лог и запоминаем (self.last_motive)."""
         stream = await self.llm.create(
             messages=self._messages(transcript, task),
             max_completion_tokens=max_tokens,
@@ -330,10 +357,16 @@ class Responder:
                 if not event.choices:
                     continue
                 buf += event.choices[0].delta.content or ""
+                if motive:
+                    buf, motive = self._take_motive(buf)
+                    if motive:
+                        continue  # строка мотива ещё не дописана — ждём
                 while (m := _SENT_END.search(buf)) is not None:
                     sentence, buf = _clean(buf[: m.end()]), buf[m.end():]
                     if sentence:
                         yield sentence
+            if motive:  # поток кончился, а мотив так и не закрылся
+                buf, _ = self._take_motive(buf + "\n")
             if tail := _clean(buf):
                 yield tail
         finally:

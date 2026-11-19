@@ -48,6 +48,8 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
   Не взаимодействовал с ботом — 0.
 - trust — изменение доверия: -1 (обманул бота, подставил, признался, что наврал), +1 (был честен,
   объяснил правду, сдержал слово), иначе 0. Шутка, которую потом признали шуткой, — не обман.
+- manner — как этот человек ОБЫЧНО говорит с ботом, до 6 слов («часто подкалывает», «объясняет всерьёз»,
+  «проверяет, поведётся ли», «заботится», «грубит»). Не изменилось или он не говорил с ботом — null.
 - moment — если delta или trust не 0: ОДНА короткая фраза от лица бота, за что («обрадовался: объяснил,
   что такое мем», «обиделся: сказал, что видит мои мысли»). Иначе null.
 - facts — главное о человеке: чем живёт, работа/учёба, во что играет, увлечения. До {facts} пунктов.
@@ -78,6 +80,13 @@ sadness (грусть: игнорировали, обижали, грустны�
 touched — если что-то из этого СИЛЬНО задело бота (о его смерти, выключении, обида, страшное, очень важное
 для него) — одна короткая фраза, что именно; иначе null. Обычная болтовня — null.
 
+3б) habits — если люди УЧАТ бота, как ему самому говорить или вести себя: разрешают словечко («ты тоже
+можешь говорить алло»), просят («называй меня Вася», «говори покороче»), советуют («отвечай „база“, когда
+согласен»). Каждая — от лица бота, С СИТУАЦИЕЙ, когда так делать: «когда начинаю разговор — говорю „алло“».
+word — само словечко, если оно есть («алло»), иначе "". source — кто научил. Просто знание о мире
+(«алло говорят по телефону») — это world, не сюда. Нечего — пустой список.
+stop_habits — словечки, которые бота просили больше НЕ говорить («хватит говорить алло» → ["алло"]), иначе [].
+
 4) expectations — только если в сообщении есть раздел «Ожидания бота». Для каждого пункта ответь на
 ТРИ отдельных вопроса:
 - answered — отреагировал ли кто-нибудь НА СЛОВА БОТА (ответил ему, посмеялся над его фразой, обругал его)
@@ -90,10 +99,11 @@ touched — если что-то из этого СИЛЬНО задело бо�
 who — ник того, чья реакция главная (или ""). what — что было на деле, коротко.
 Нет раздела — пустой список.
 
-Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "trust": число, "moment": "строка" или null,
+Ответь строго JSON: {{"changes": [{{"name": "ник как в расшифровке", "delta": число, "trust": число, "manner": "строка" или null, "moment": "строка" или null,
   "facts": [..] или null, "plans": [..] или null, "hooks": [..] или null}}],
   "world": [{{"text": "факт", "source": "ник", "important": true|false}}],
   "feelings": {{"fear": число, "joy": число, "trust": число, "sadness": число}}, "touched": "строка" или null,
+  "habits": [{{"text": "когда … — …", "word": "словечко" или "", "source": "ник"}}], "stop_habits": ["словечко"],
   "expectations": [{{"n": номер, "answered": true|false, "happened": true|false, "nice": -1|0|1, "who": "ник", "what": "строка"}}]}}"""
 
 
@@ -110,6 +120,7 @@ class Relation:
     closeness: float = 0.0         # близость 0…10: сколько времени провели вместе
     moments: list[dict] = field(default_factory=list)  # [{"text", "sign", "lived"}] — за что любит/обижен
     scar: float = 0.0              # шрам от обмана: обида и недоверие тают только до −scar
+    manner: str = ""               # как он обычно говорит с ботом («часто подкалывает») — чтобы читать мотив
     # устаревшие поля прошлых версий — подхватываются как факты
     notes: list[str] = field(default_factory=list)
     profile: str = ""
@@ -134,6 +145,8 @@ class Relation:
             bits.append("ты его пока почти не знаешь")
         if self.scar >= 1:
             bits.append("он тебя когда-то сильно обманул — осадок остался")
+        if self.manner:
+            bits.append(f"обычно с тобой: {self.manner}")
         return "; ".join(b for b in bits if b)
 
     def moments_text(self) -> str:
@@ -493,7 +506,7 @@ class RelationsJudge:
             for n, uid in humans.items():
                 r = self.store.get(uid, n)
                 if n in full_rows:
-                    rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; "
+                    rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; manner={r.manner!r}; "
                                 f"facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
                 else:  # сказал мимоходом — досье не показываем (и не даём его переписать, см. ниже)
                     rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; досье не меняй (null)")
@@ -547,6 +560,8 @@ class RelationsJudge:
                     rel.trust = min(-rel.scar, rel.trust + FORGIVE_STEP / 2)
                 rel.score = max(-10.0, min(10.0, rel.score + delta))
                 rel.trust = max(-10.0, min(10.0, rel.trust + tdelta * TRUST_STEP))
+                if isinstance(ch.get("manner"), str) and ch["manner"].strip() and name in full_rows:
+                    rel.manner = ch["manner"].strip()[:60]
                 if (delta or tdelta) and isinstance(ch.get("moment"), str):
                     rel.add_moment(ch["moment"], 1 if delta + tdelta > 0 else -1, now_lived)
                 if tdelta:
@@ -567,6 +582,13 @@ class RelationsJudge:
             if isinstance(data.get("feelings"), dict):
                 get_emotions().apply(data["feelings"])
             self._note_touched(data)
+            try:
+                from bot import persona
+                from bot.brain.habits import get_habits
+
+                get_habits().learn(data.get("habits"), data.get("stop_habits"), persona.BOT_NAME)
+            except Exception:
+                log.exception("привычки: не смог записать")
             self._check_expectations(exps, data.get("expectations"), humans)
             # что узнал о мире — в отдельную память знаний; новое утоляет любопытство
             world = [(str(w.get("text", "")), str(w.get("source", "")), w.get("important") is True)

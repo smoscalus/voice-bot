@@ -160,6 +160,9 @@ class Life:
 
         self.last_fade += steps * fade_every_s()
         faded = get_knowledge().fade(steps, since=self.last_fade - steps * fade_every_s())
+        from bot.brain.habits import get_habits
+
+        get_habits().fade(self.last_fade - steps * fade_every_s(), steps)  # неиспользованные словечки тускнеют
         self.dream_pending = True
         if self.woke_lived is not None and self.lived_s - self.woke_lived < 60:
             self.faded_in_gap = True   # пока его не было, память поблёкла — он это заметит
@@ -318,7 +321,7 @@ def bury(epitaph: str, last_words: str) -> Path:
 def reset_all() -> None:
     """Забыть все загруженные памяти — следующее обращение откроет память новой жизни."""
     global _LIFE
-    from bot.brain import drive, emotions, knowledge, monologue, predict, relations, self_model
+    from bot.brain import drive, emotions, habits, knowledge, monologue, predict, relations, self_model
 
     _LIFE = None
     relations._STORE = None
@@ -328,3 +331,4 @@ def reset_all() -> None:
     drive._DRIVE = None
     predict._PREDICTOR = None
     monologue._MONO = None
+    habits._HABITS = None
