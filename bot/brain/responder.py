@@ -109,8 +109,11 @@ def find_repeat(sentence: str, recent: list[str], threshold: int = 80) -> str | 
     if len(s.split()) < 3 or len(s_words) < 2:
         return None
     s_c = " ".join(_content(s))
+    statement = "?" not in sentence
     for line in recent:
         for old in re.split(r"(?<=[.!?…])\s+", line):
+            if statement and "?" in old:
+                continue  # раньше спросил, теперь понял и говорит утверждением — это шаг вперёд, а не повтор
             o_list = _content(_norm_for_repeat(old))
             o_words = set(o_list)
             if len(o_words) < 2:  # «не знаю», «нормально» — не считаем
@@ -175,10 +178,12 @@ _MOTIVE_LINE = re.compile(r"мотив\s*:\s*([^\n]*?)\s*(?:\n+|(?<=[.!?])\s+(?=
 
 
 class Responder:
-    def __init__(self, llm: LLMRouter, system_prompt: str, extra_context=None, recent_lines=None):
+    def __init__(self, llm: LLMRouter, system_prompt: str, extra_context=None, recent_lines=None,
+                 live_context=None):
         self.llm = llm
         self.system_prompt = system_prompt
-        self.extra_context = extra_context  # функция → доп. текст в системный промпт (отношения к людям)
+        self.extra_context = extra_context  # функция → доп. текст в системный промпт (почти неизменный)
+        self.live_context = live_context    # функция → подвижное (чувства, что вспомнил) — в конец, к расшифровке
         self.recent_lines = recent_lines    # функция → последние реплики бота (для защиты от повторов)
 
     # ---------------------------------------------------------------- задачи
@@ -313,9 +318,12 @@ class Responder:
         system = self.system_prompt
         if self.extra_context and (extra := self.extra_context()):
             system = f"{system}\n{extra}"
+        live = self.live_context() if self.live_context else ""
+        head = f"Что с тобой сейчас:\n{live}\n\n" if live else ""
         return [
             {"role": "system", "content": system},
-            {"role": "user", "content": f"Расшифровка последних минут разговора:\n{transcript}\n\nЗадача: {task}"},
+            {"role": "user",
+             "content": f"{head}Расшифровка последних минут разговора:\n{transcript}\n\nЗадача: {task}"},
         ]
 
     async def _generate(self, transcript: str, task: str) -> str:

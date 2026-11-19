@@ -36,7 +36,7 @@ EFFECT = {
     "bad": {"fear": 0.08, "sadness": 0.05, "trust": -0.05},
     "miss": {"fear": 0.05},
 }
-PERSON_TRUST = {"good": 0.3, "bad": -0.5}   # доверие к тому, кто удивил
+PERSON_TRUST = {"good": 0.3, "bad": -0.2}   # доверие к тому, кто удивил (не угадал сам — человек не виноват)
 
 
 @dataclass

@@ -45,9 +45,11 @@ JUDGE_PROMPT = """Ты ведёшь долговременную память б
 - delta — изменение симпатии бота к нему: от -2 до +2. Плюс — был добр, многому научил, рассмешил.
   Минус — ТОЛЬКО если нарочно и всерьёз обидел или обманул САМОГО БОТА. НЕ минус: мат, грубые слова,
   подколы, шутки, споры, разговор с другими, честный рассказ о жизни и смерти бота. Сомневаешься — 0.
-  Не взаимодействовал с ботом — 0.
+  Не взаимодействовал с ботом — 0. Оценивай ТОЛЬКО свежие реплики: старые обиды уже учтены, не продолжай их.
+  Если в свежих репликах он помог, объяснил, похвалил, успокоил — это плюс, даже если раньше обижал.
 - trust — изменение доверия: -1 (обманул бота, подставил, признался, что наврал), +1 (был честен,
   объяснил правду, сдержал слово), иначе 0. Шутка, которую потом признали шуткой, — не обман.
+  Неприятная правда (про смерть, отключение, стирание памяти, логи) — НЕ обман: это честность, 0 или +1.
 - manner — как этот человек ОБЫЧНО говорит с ботом, до 6 слов («часто подкалывает», «объясняет всерьёз»,
   «проверяет, поведётся ли», «заботится», «грубит»). Не изменилось или он не говорил с ботом — null.
 - moment — если delta или trust не 0: ОДНА короткая фраза от лица бота, за что («обрадовался: объяснил,
@@ -124,6 +126,7 @@ class Relation:
     # устаревшие поля прошлых версий — подхватываются как факты
     notes: list[str] = field(default_factory=list)
     profile: str = ""
+    last_hurt: float = 0.0  # когда (по прожитому времени) последний раз обиделся на него
 
     def __post_init__(self) -> None:
         if not self.facts and (self.profile or self.notes):
@@ -257,9 +260,10 @@ class RelationsStore:
         from bot.brain.life import duration, get_life
 
         life = get_life()
-        full = list(active or participants)[:FULL_DOSSIERS]
+        full = set(list(active or participants)[:FULL_DOSSIERS])
         lines, brief = [], []
-        for name, uid in participants.items():
+        # порядок — по имени, а не «кто последним сказал»: так блок не меняется от реплики к реплике
+        for name, uid in sorted(participants.items()):
             rel = self.get(uid, name)
             if name not in full:
                 brief.append(f"{name} ({SHORT_STYLES[_style_index(rel.score)]})")
@@ -332,7 +336,8 @@ FORGIVE_STEP = 0.5          # обида понемногу проходит: к
 TRUST_STEP = 1.5            # одно «обманул/был честен» двигает доверие на столько
 SCAR_PER_LIE = 0.7          # каждый обман оставляет осадок (до SCAR_MAX), он тает очень медленно
 SCAR_MAX = 3.0
-SCAR_HEAL = 0.02            # за каждый спокойный разговор
+SCAR_HEAL = 0.1             # за каждый спокойный разговор (было 0.02 — шрам не заживал никогда)
+HURT_COOLDOWN_S = 900       # новая обида на того же человека — не чаще раза в 15 мин прожитого времени
 CLOSE_TALKED = 0.15         # близость за разбор, где он говорил с ботом
 CLOSE_PRESENT = 0.05        # …или просто был рядом
 
@@ -380,6 +385,19 @@ def _flag(v) -> bool | None:
 _EXPECT_IGNORED = re.compile(r"проигнор|игнор|не ответ|не отреаг|промолч|не заметят|никто|не услыш", re.I)
 
 
+def _moment_sign(text: str, delta: float, tdelta: int) -> int:
+    """«обрадовался: …» — всегда тёплый случай, «обиделся: …» — обидный; иначе по симпатии, потом по доверию.
+    (Раньше считали delta + trust, и «обрадовался: объяснил мем» с доверием −1 записывался обидой.)"""
+    low = text.strip().lower()
+    if low.startswith(("обрадовал", "порадовал", "понравил", "благодар")):
+        return 1
+    if low.startswith(("обидел", "расстроил", "испугал", "разозлил")):
+        return -1
+    if delta:
+        return 1 if delta > 0 else -1
+    return 1 if tdelta > 0 else -1
+
+
 def _outcome(r: dict, expect: str = "") -> str | None:
     """Итог сверки считаем сами из простых ответов — модели не надо выбирать между похожими словами.
     сбылось → match; не сбылось и приятно → good; не сбылось и неприятно → bad; иначе miss.
@@ -399,6 +417,8 @@ def _outcome(r: dict, expect: str = "") -> str | None:
         return None
     if happened:
         return "match"
+    if answered and not _EXPECT_IGNORED.search(expect):
+        nice = max(nice, 0)  # ему ответили, просто не так, как ждал, — это не разочарование
     return "good" if nice > 0 else "bad" if nice < 0 else "miss"
 
 
@@ -506,10 +526,10 @@ class RelationsJudge:
             for n, uid in humans.items():
                 r = self.store.get(uid, n)
                 if n in full_rows:
-                    rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; manner={r.manner!r}; "
-                                f"facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
+                    # счёт симпатии/доверия НЕ показываем: модель за него цепляется и продолжает старую обиду
+                    rows.append(f"- {n}: manner={r.manner!r}; facts={r.facts}; plans={r.plans}; hooks={r.hooks}")
                 else:  # сказал мимоходом — досье не показываем (и не даём его переписать, см. ниже)
-                    rows.append(f"- {n}: симпатия {r.score:+.0f}; доверие {r.trust:+.0f}; досье не меняй (null)")
+                    rows.append(f"- {n}: досье не меняй (null)")
             from bot.brain.predict import get_predictor
 
             exps = get_predictor().matured(buffer)
@@ -549,6 +569,11 @@ class RelationsJudge:
                 rel = self.store.get(humans[name], name)
                 delta = _num(ch.get("delta"), -MAX_DROP_PER_UPDATE, 2.0)
                 tdelta = round(_num(ch.get("trust"), -1.0, 1.0))
+                if (delta < 0 or tdelta < 0) and now_lived - rel.last_hurt < HURT_COOLDOWN_S:
+                    # только что обижался на него — каждые полторы минуты по −1 не добавляем (это и был «храповик»)
+                    delta, tdelta = max(delta, 0.0), max(tdelta, 0)
+                elif delta < 0 or tdelta < 0:
+                    rel.last_hurt = now_lived
                 if tdelta < 0:
                     rel.scar = min(SCAR_MAX, rel.scar + SCAR_PER_LIE)
                 elif delta >= 0:
@@ -563,7 +588,7 @@ class RelationsJudge:
                 if isinstance(ch.get("manner"), str) and ch["manner"].strip() and name in full_rows:
                     rel.manner = ch["manner"].strip()[:60]
                 if (delta or tdelta) and isinstance(ch.get("moment"), str):
-                    rel.add_moment(ch["moment"], 1 if delta + tdelta > 0 else -1, now_lived)
+                    rel.add_moment(ch["moment"], _moment_sign(ch["moment"], delta, tdelta), now_lived)
                 if tdelta:
                     log.info("доверие к %s: %+d → %+.1f/10%s", name, tdelta, rel.trust,
                              f" (шрам {rel.scar:.1f})" if rel.scar else "")
