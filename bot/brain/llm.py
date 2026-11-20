@@ -78,6 +78,10 @@ async def _wait_turn() -> None:
 # молча отрезает начало (а там характер), и бот ведёт себя странно. Поэтому пишем в лог реальный размер
 # (его сообщает сама модель) и предупреждаем, когда запас маленький.
 WARN_SHARE = 0.85
+# Ollama молча обрезает промпт до своего окна: тогда размер ровно 2048/4096 (+пара служебных токенов)
+_CUT_SIZES = {n + d for n in (2048, 4096) for d in range(4)}
+# «думающая» локальная модель тратит токены на мысли из того же лимита — добавляем запас
+THINK_EXTRA_TOKENS = 800
 
 
 def context_limit() -> int:
@@ -94,7 +98,11 @@ def note_usage(usage, tag: str, limit: int, max_out: int = 0) -> None:
     prompt = getattr(usage, "prompt_tokens", None) if usage is not None else None
     if not prompt:
         return
-    if limit and prompt + max_out > limit * WARN_SHARE:
+    if limit and prompt in _CUT_SIZES and prompt + 64 < limit:
+        log.warning("🧠 %s: промпт ровно %d токенов — похоже, Ollama ОБРЕЗАЛА его до своего окна, а с начала "
+                    "пропали характер и правила (отсюда бред и простыни текста). У самой Ollama окно меньше %d: %s",
+                    tag or "запрос", prompt, limit, ollama_ctx_hint(limit))
+    elif limit and prompt + max_out > limit * WARN_SHARE:
         log.warning("🧠 %s: промпт %d токенов + ответ до %d — почти край окна %d! Модель может забыть начало "
                     "(характер). Помогут OLLAMA_CONTEXT_LENGTH побольше или меньше людей в войсе.",
                     tag or "запрос", prompt, max_out, limit)
@@ -103,11 +111,37 @@ def note_usage(usage, tag: str, limit: int, max_out: int = 0) -> None:
                  f" (запас {limit - prompt - max_out})" if limit else "")
 
 
+def ollama_ctx_hint(limit: int) -> str:
+    """Как задать окно самой Ollama на этой системе — коротко, для лога."""
+    import sys
+
+    if sys.platform == "win32":
+        return (f"запусти start.bat (он пропишет OLLAMA_CONTEXT_LENGTH={limit}) или задай эту переменную "
+                "в системе, потом закрой Ollama у часов и открой снова.")
+    return (f"на Linux: ./start.sh config — он настроит службу Ollama, или вручную: "
+            f"sudo systemctl edit ollama → Environment=\"OLLAMA_CONTEXT_LENGTH={limit}\" → sudo systemctl restart ollama.")
+
+
+def _thought(obj) -> str:
+    """Текст «размышлений» модели, если сервер его прислал (Ollama: reasoning, иные: reasoning_content)."""
+    for name in ("reasoning", "reasoning_content"):
+        v = getattr(obj, name, None) or (getattr(obj, "model_extra", None) or {}).get(name)
+        if v:
+            return v
+    return ""
+
+
 class LLMRouter:
     def __init__(self, client: AsyncOpenAI, models: list[str], reasoning_effort: str | None,
                  timeout: float = 12.0, background: bool = False, preemptible: bool = False,
-                 ctx_limit: int = 0):
+                 ctx_limit: int = 0, think: bool | None = None, tag: str = ""):
         self.ctx_limit = ctx_limit        # окно модели (только локальная): следим, чтобы промпт влезал
+        # размышления локальной модели: False — выключить (живой ответ: быстро), True — включить (фоновые дела:
+        # никто не ждёт, а пишут аккуратнее), None — не трогать (как решит сама модель)
+        self.think = think
+        self.tag = tag                    # для лога: «ответ», «фон», «встревать ли»
+        self._think_ok = True             # сервер понимает выключатель размышлений (старая Ollama — нет)
+        self._think_seen = False
         self.background = background      # фоновые дела: ждут, пока бот не отвечает людям
         self.preemptible = preemptible    # и обрываются, если ответ понадобился (имеет смысл для Ollama)
         self.client = client
@@ -145,7 +179,33 @@ class LLMRouter:
         resp = await self._create_raw(**kwargs)
         if not kwargs.get("stream"):
             note_usage(getattr(resp, "usage", None), tag, self.ctx_limit, kwargs.get("max_completion_tokens", 0))
+            if resp.choices:
+                self.note_thought(_thought(resp.choices[0].message))
         return resp
+
+    def note_thought(self, text: str) -> None:
+        """Один раз в лог: думала ли модель — видно, сработал ли выключатель размышлений."""
+        if self._think_seen or not self.ctx_limit:
+            return
+        if text:
+            self._think_seen = True
+            if self.think is False:
+                log.warning("🐢 модель (%s) всё равно думает перед ответом (%d символов мыслей) — выключатель "
+                            "не сработал, ответы медленнее. Обнови Ollama.", self.tag or "запрос", len(text))
+            else:
+                log.info("💭 модель (%s) думает перед ответом — как и задумано", self.tag or "запрос")
+        elif self.think:
+            self._think_seen = True
+            log.info("модель (%s) не думает, хотя можно (THINK_BACKGROUND=on) — значит, не умеет; это не страшно",
+                     self.tag or "запрос")
+
+    def _extra_body(self, model: str) -> dict | None:
+        if not self.ctx_limit:  # облако: как раньше (GROQ_REASONING_EFFORT)
+            return _reasoning_for(model, self.reasoning_effort)
+        if self.think is None or not self._think_ok:
+            return None
+        # Ollama (OpenAI-совместимый вход): reasoning_effort none/low/medium/high; think — для её родного входа
+        return {"reasoning_effort": "medium" if self.think else "none", "think": self.think}
 
     async def _create_raw(self, **kwargs):
         now = time.monotonic()
@@ -155,11 +215,23 @@ class LLMRouter:
             kw = dict(kwargs)
             if "gpt-oss" in model and "max_completion_tokens" in kw:
                 kw["max_completion_tokens"] += 250  # gpt-oss часть токенов тратит на «размышления»
+            if self.ctx_limit and "max_completion_tokens" in kw:
+                if self.think:
+                    kw["max_completion_tokens"] += THINK_EXTRA_TOKENS
+                # Ollama знает только старое имя max_tokens, новое молча пропускает — и длина ответа без потолка
+                kw["max_tokens"] = kw.pop("max_completion_tokens")
             try:
                 # max_retries=0: библиотека openai сама ждёт по минуте при 429 — нам это не нужно,
                 # мы мгновенно переходим на следующую модель
                 return await self.client.with_options(max_retries=0, timeout=self.timeout).chat.completions.create(
-                    model=model, extra_body=_reasoning_for(model, self.reasoning_effort), **kw)
+                    model=model, extra_body=self._extra_body(model), **kw)
+            except openai.BadRequestError as e:
+                if self.ctx_limit and self._think_ok and self.think is not None and "reason" in str(e).lower():
+                    # старая Ollama не знает выключателя размышлений — работаем без него
+                    log.warning("Ollama не понимает выключатель размышлений (%s) — обнови её; пока без него", e)
+                    self._think_ok = False
+                    return await self._create_raw(**kwargs)
+                raise
             except openai.RateLimitError as e:
                 wait = _retry_after(e)
                 self._blocked_until[model] = time.monotonic() + wait

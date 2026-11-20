@@ -148,7 +148,9 @@ class VoiceBot(commands.Bot):
                 model=self.settings.llm_model,
                 messages=[{"role": "system", "content": persona.SYSTEM_PROMPT},
                           {"role": "user", "content": "привет"}],
-                max_completion_tokens=1,
+                # Ollama понимает только max_tokens (иначе пишет на «привет» целый ответ) и без размышлений
+                **({"max_tokens": 1, "extra_body": {"reasoning_effort": "none", "think": False}}
+                   if self.settings.provider == "local" else {"max_completion_tokens": 1}),
             )
             log.info("LLM warmed up")
         except Exception as e:

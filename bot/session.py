@@ -59,7 +59,8 @@ HURT_FELT_S = 3600          # обидчика опасается, только 
 
 _ANGLE_TAG = "\x00угол\x00"
 _STOP = {"что", "значит", "это", "меня", "тебя", "можно", "такое", "какой", "какая", "почему", "можете",
-         "можешь", "расскажи", "рассказать", "подробнее", "вопрос", "спросить", "петрык", "петрик"}
+         "можешь", "расскажи", "рассказать", "подробнее", "вопрос", "спросить", "петрык", "петрик",
+         *persona.WAKE_WORDS}
 
 
 def _topic_words(text: str) -> set[str]:
@@ -254,13 +255,16 @@ class VoiceSession:
         from bot.brain.llm import context_limit
 
         ctx = context_limit() if settings.provider == "local" else 0  # у облака окно большое — не следим
+        # «встревать ли» решается на лету — без размышлений, как и ответ
         light_llm = LLMRouter(client, [settings.classifier_model, *fallbacks], settings.reasoning_effort, t,
-                              ctx_limit=ctx)
+                              ctx_limit=ctx, think=settings.think_reply, tag="встревать ли")
         self.light_llm = light_llm
         # память, дневник, книжка, сны — фоном: уступают очередь живому ответу (локальная модель одна на всё)
         memory_llm = LLMRouter(client, [settings.memory_model, settings.classifier_model, *fallbacks],
-                               settings.reasoning_effort, max(t, 60), background=True,
-                               preemptible=settings.provider == "local", ctx_limit=ctx)
+                               settings.reasoning_effort, max(t, 60) * (2 if settings.think_background else 1),
+                               background=True,
+                               preemptible=settings.provider == "local", ctx_limit=ctx,
+                               think=settings.think_background, tag="фон")
         self.classifier = InterestClassifier(light_llm, persona.BOT_NAME, persona.INTERVENE_RULES)
         if hasattr(self, "judge"):
             self.judge.llm = memory_llm
@@ -269,7 +273,8 @@ class VoiceSession:
         self.self_model = get_self_model(memory_llm)  # досье на самого себя: кто я, увлечения, задания, страхи
         self.self_model.llm = memory_llm
         self.responder = Responder(
-            LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t, ctx_limit=ctx),
+            LLMRouter(client, [settings.llm_model, *fallbacks], settings.reasoning_effort, t, ctx_limit=ctx,
+                      think=settings.think_reply, tag="ответ"),
             self._system_prompt(settings), extra_context=self._relations_context,
             recent_lines=lambda: list(self._my_lines), live_context=self._live_context)
 

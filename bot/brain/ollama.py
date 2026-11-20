@@ -37,6 +37,15 @@ async def report_gpu(url: str) -> None:
             continue
         pct = round(100 * vram / size)
         name = m.get("name", "?")
+        from bot.brain.llm import context_limit, ollama_ctx_hint
+
+        want = context_limit()
+        if (ctx := m.get("context_length")) and ctx < want:
+            log.warning("🧠 %s загружена с окном %d токенов, а бот рассчитывает на %d — длинные промпты Ollama "
+                        "будет обрезать (теряется характер, бот несёт бред). Как поправить: %s",
+                        name, ctx, want, ollama_ctx_hint(want))
+        elif ctx:
+            log.info("🧠 %s: окно %d токенов — совпадает с настройкой бота", name, ctx)
         if pct >= 99:
             log.info("🎮 %s целиком на видеокарте (%.1f ГБ)", name, vram / 2**30)
         elif pct == 0:

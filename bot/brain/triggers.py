@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
 
+from bot import persona
+
 
 def normalize(text: str) -> str:
     t = text.lower().replace("ё", "е")
@@ -18,7 +20,9 @@ _SECOND_PERSON = {"ты", "тебя", "тебе", "тобой", "твой", "т�
 # Как Whisper коверкает «Петрык»: «Этрик», «Катрык», «Тетрик», «Пьетрику», «Пайтрек», «Зэтрык»…
 # Начало слова — короткий «огрызок» из списка, потом «-трик/-трык/-трек…» (+ падежное окончание).
 # «Электрик», «метрика», «трек» не подходят: у них другое начало или его нет вовсе.
-NAME_LIKE = re.compile(r"^(?:пь?е?|пэ|па|пай|пе?ре|э|е|ка|кэ|ке|те|ве|зэ|ze)[тд]р[иыеэаоу]к(?:а|у|ом|е|ик)?$")
+_PETRYK_LIKE = re.compile(r"^(?:пь?е?|пэ|па|пай|пе?ре|э|е|ка|кэ|ке|те|ве|зэ|ze)[тд]р[иыеэаоу]к(?:а|у|ом|е|ик)?$")
+# правило под «Петрыка»; у другого имени (BOT_NAME в .env) — только его формы и нечёткое сравнение
+NAME_LIKE = _PETRYK_LIKE if persona.IS_DEFAULT_NAME else re.compile(r"(?!)")
 # начала обычных слов, которые нечёткое сравнение путает с именем («метрика» ≈ «петрика»); имена с такими
 # началами («Тетрик», «Кетрик») ловит NAME_LIKE ещё до нечёткого сравнения
 _REAL_WORD_STARTS = {"ме", "ма", "мо", "те", "ке"}
@@ -91,7 +95,9 @@ class TriggerDetector:
             before = text[:a].rstrip()
             after = text[b:].lstrip()
             lead = all(t in _LEAD_WORDS for t in toks[:i])  # в начале (можно после «эй», «ну», «слушай»)
-            plain = not w.endswith(("ка", "ку", "ком", "ке", "ом", "ым", "ем"))  # «Петрика», «Петрику» — о нём
+            # «Петрика», «Петрику», «Васю» — о нём, а не к нему
+            plain = (not w.endswith(("ка", "ку", "ком", "ке", "ом", "ым", "ем")) if persona.IS_DEFAULT_NAME
+                     else w not in persona.NAME_OBLIQUE)
             if lead or (i == len(words) - 1 and plain):
                 return True
             if plain and after[:1] in (",", "!", "?", ":"):

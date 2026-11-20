@@ -42,7 +42,14 @@ ARCHIVE_BELOW = 0.3      # слабее — забыл (в архив)
 _JUNK = re.compile(r"ясного значения|неясн|непонятн|не имеет значения|не имеют значения|неразборчив", re.I)
 _WORD = re.compile(r"[а-яёa-z0-9]{4,}", re.I)
 # записи о самом боте («Петрык понял, что…») — это его дневник, а не знание о мире
-_ABOUT_SELF = re.compile(r"^(петр[ыи]к|бот)\b.{0,40}\b(понял|узнал|не понимает|пытается|чувствует|не уверен|"
+def _self_names() -> str:
+    from bot import persona
+
+    names = {re.escape(w) for w in persona.WAKE_WORDS} | {"петр[ыи]к"}
+    return "|".join(sorted(names, key=len, reverse=True))
+
+
+_ABOUT_SELF = re.compile(rf"^({_self_names()})\b.{{0,40}}\b(понял|узнал|не понимает|пытается|чувствует|не уверен|"
                          r"задумал|хочет|боится|запомнил)", re.I)
 
 

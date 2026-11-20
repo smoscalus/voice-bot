@@ -18,6 +18,16 @@ def _i(name: str, default: int) -> int:
     return int(os.getenv(name, default))
 
 
+def _onoff(name: str, default: str) -> bool | None:
+    """on/off/auto → True/False/None (auto — не трогать, как решит модель)."""
+    v = os.getenv(name, default).strip().lower()
+    if v in ("on", "1", "true", "yes", "да"):
+        return True
+    if v in ("off", "0", "false", "no", "нет"):
+        return False
+    return None
+
+
 def _list(name: str, default: str) -> list[str]:
     return [m.strip() for m in os.getenv(name, default).split(",") if m.strip()]
 
@@ -79,6 +89,9 @@ class Settings:
     sfx_enabled: bool  # «угу»/«хм…» голосом бота
     own_initiative_gap_s: float  # «свои дела»: сам начинает тему не чаще, чем раз в столько секунд
     persona_prompt: str  # auto / full / lite — полный или облегчённый характер (lite — для локальных моделей)
+    # размышления локальной модели: в живом ответе (быстро — выкл) и в фоновых делах (досье, сны — можно вкл)
+    think_reply: bool | None
+    think_background: bool | None
 
 
 def _brain(provider: str) -> dict:
@@ -100,7 +113,7 @@ def _brain(provider: str) -> dict:
             llm_timeout_s=12.0,
         )
     # local: Ollama на этом компьютере (или в соседнем docker-контейнере) + локальный Whisper
-    model = _s("OLLAMA_MODEL", "qwen2.5:7b")
+    model = _s("OLLAMA_MODEL", "qwen3.5:9b")
     return dict(
         openai_api_key="ollama",
         openai_base_url=_s("OLLAMA_URL", "http://localhost:11434").rstrip("/") + "/v1",
@@ -173,4 +186,6 @@ def load_settings(provider: str | None = None) -> Settings:
         sfx_enabled=_s("SFX", "on").lower() in ("on", "1", "true"),
         own_initiative_gap_s=_f("OWN_INITIATIVE_GAP_S", 600),
         persona_prompt=_s("PERSONA_PROMPT", "auto").lower(),
+        think_reply=_onoff("THINK_REPLY", "off"),
+        think_background=_onoff("THINK_BACKGROUND", "on"),
     )

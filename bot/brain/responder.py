@@ -5,7 +5,7 @@ import re
 from typing import AsyncIterator
 
 from bot import persona
-from bot.brain.llm import LLMRouter
+from bot.brain.llm import LLMRouter, _thought
 
 log = logging.getLogger(__name__)
 
@@ -160,7 +160,9 @@ def find_parrot(sentence: str, heard: list[str]) -> str | None:
     return find_repeat(sentence, heard)
 
 
-_SELF_ADDRESS = re.compile(r"^\s*(?:п[еэаь]?т(?:р[иыеэ]к|ер|р)\w{0,2})\s*[,!.:]\s*", re.IGNORECASE)
+_SELF_ADDRESS = re.compile(r"^\s*(?:п[еэаь]?т(?:р[иыеэ]к|ер|р)\w{0,2}|"
+                           + "|".join(re.escape(w) for w in sorted(persona.WAKE_WORDS, key=len, reverse=True))
+                           + r")\s*[,!.:]\s*", re.IGNORECASE)
 _NAME_GREETING_ONLY = re.compile(r"^\s*[^,.!?]{1,30},\s*(привет|здорово|здарова|хай)\s*[.!]*\s*$", re.IGNORECASE)
 _LEADING_GREETING = re.compile(r"^\s*(привет|здорово|здарова|хай)\s*[,!.]?\s*", re.IGNORECASE)
 
@@ -376,7 +378,10 @@ class Responder:
                     note_usage(event.usage, "ответ", getattr(self.llm, "ctx_limit", 0), max_tokens)
                 if not event.choices:
                     continue
-                buf += event.choices[0].delta.content or ""
+                delta = event.choices[0].delta
+                if not getattr(self.llm, "_think_seen", True) and (thought := _thought(delta)):
+                    self.llm.note_thought(thought)
+                buf += delta.content or ""
                 if motive:
                     buf, motive = self._take_motive(buf)
                     if motive:
