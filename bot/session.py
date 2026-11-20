@@ -140,13 +140,15 @@ SPECULATIVE_RESTARTS = 2    # сколько раз можно передума�
 
 
 def filler_kind(lines) -> str:
-    """Какой звук-рефлекс: позвали по имени — «м?», спросили — «хм…», рассказали — «угу»."""
+    """Какой звук-рефлекс: позвали только по имени — «м?» (пусть договорит), во всех остальных случаях —
+    «хм…/э-э…»: держит паузу, чтобы люди не приняли звук за ответ и не заговорили поверх."""
+    from bot.brain.triggers import NAME_LIKE
+
     last = lines[-1].text.strip() if lines else ""
-    if len(last.split()) <= 3 and "?" not in last:
+    words = [w for w in re.findall(r"[\w-]+", last.lower()) if not NAME_LIKE.match(w)]
+    if not words or (len(words) == 1 and words[0] in ("алло", "ало", "эй", "ау")):
         return "call"          # «Петрык!», «Петрик, алло»
-    if "?" in last:
-        return "filler"
-    return "back"
+    return "think"
 
 
 def is_whisper_ghost(text: str, confidence: float | None, duration_s: float) -> bool:
@@ -278,7 +280,8 @@ class VoiceSession:
         style = settings.persona_prompt
         if style == "auto":
             style = "lite" if settings.provider == "local" else "full"
-        return persona.SYSTEM_PROMPT_LITE if style == "lite" else persona.SYSTEM_PROMPT
+        base = persona.SYSTEM_PROMPT_LITE if style == "lite" else persona.SYSTEM_PROMPT
+        return f"{base}\n\n{persona.ANSWER_RULES}"
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -375,13 +378,7 @@ class VoiceSession:
             if (not self._reconnecting and time.monotonic() - self._last_reconnect > 30
                     and (get_health(self.vc).is_deaf() or self._receiver_dead())):
                 self._spawn(self._reconnect())
-            # «угу»: человек долго рассказывает боту и сделал паузу — поддакнуть, как живой слушатель
-            if (self.sfx and not self.muted_since and not self.player.is_playing and self.policy.in_follow_up()
-                    and time.monotonic() - self._last_backchannel > 15
-                    and self.segmenter.long_speech_pause() and random.random() < 0.5):
-                self._last_backchannel = time.monotonic()
-                if clip := self.sfx.random("back"):
-                    self._spawn(self._play_clip(clip))
+            # (раньше тут было «угу» в паузах длинного рассказа — убрано: люди принимали его за ответ)
             # barge-in: заговорили поверх бота — он замолкает (как голосовой режим ChatGPT).
             # Инициативную реплику обрываем быстрее, прямой ответ — если говорят дольше barge_in_ms.
             if self.player.is_playing:
@@ -652,12 +649,12 @@ class VoiceSession:
             self._life_busy = False
 
     def _mute(self, who: str) -> None:
-        """«Петрык, помолчи»: замолкает сразу (даже посреди фразы), тихо говорит «угу» и молчит."""
+        """«Петрык, помолчи»: замолкает сразу (даже посреди фразы), тихо говорит «понял, молчу» и молчит."""
         self.muted_since = time.monotonic()
         log.info("%s попросил помолчать — молчу", who)
         if self.player.is_playing:
             self.player.interrupt()
-        elif self.sfx and (clip := self.sfx.random("back")):
+        elif self.sfx and (clip := self.sfx.random("muted")):
             self._spawn(self._play_clip(clip))
         get_emotions().apply({"sadness": 0.1, "joy": -0.05})
 
@@ -805,8 +802,8 @@ class VoiceSession:
         self._life_busy = True
         try:
             with foreground():
-                if self.sfx and (clip := self.sfx.random("back")):
-                    self._spawn(self._play_clip(clip))  # «угу» — понял, читает
+                if self.sfx and (clip := self.sfx.random("reading")):
+                    self._spawn(self._play_clip(clip))  # «щас, гляну в книжке…»
                 try:
                     res = await book.read_one(self.light_llm, book.requested_term(text), asked=True)
                 except Exception:

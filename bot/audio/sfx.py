@@ -13,10 +13,14 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-BACKCHANNEL = ["Угу.", "Ага.", "Мгм.", "Ну-ну.", "Ага, ага."]
-FILLERS = ["Хм…", "Так…", "Ммм…", "Ну…", "Эээ…", "Пф…"]
-CALLS = ["М?", "Да?", "А?", "Слушаю."]   # позвали по имени — отозвался, пока думает
-AGAIN = ["Ага…", "А, так…", "Угу, щас…", "А, ну…"]  # человек договорил ещё — «услышал, думаю заново»
+# Ничего, что можно принять за ответ («угу», «ага», «да?», «ну»), — люди слышат в этом «твоя очередь»
+# и начинают говорить поверх. Только «погоди, я думаю»: так держат паузу за собой.
+THINK = ["Погоди…", "Секунду…", "Дай подумать…", "Щас, погоди…", "Услышал, дай минутку…"]
+FILLERS = THINK                 # «хм…», если голос не готов за ~0.9 с (облако) — те же фразы
+CALLS = ["Секунду…", "Щас…"]    # позвали только по имени
+AGAIN = ["Так, погоди…", "Услышал, щас…", "Погоди-погоди…"]  # человек договорил ещё — думает заново
+MUTED = ["Понял, молчу."]       # «Петрык, помолчи»
+READING = ["Щас, гляну в книжке…"]  # «почитай в книжке»
 CACHE_DIR = Path("models/sfx")
 
 
@@ -39,7 +43,8 @@ class SoundBank:
     def __init__(self, tts, voice_key: str):
         self.tts = tts
         self.dir = CACHE_DIR / voice_key.replace("/", "_")
-        self.clips: dict[str, list[bytes]] = {"back": [], "filler": [], "call": [], "again": []}
+        self.clips: dict[str, list[bytes]] = {"filler": [], "call": [], "think": [], "again": [], "muted": [],
+                                              "reading": []}
         self._last: bytes | None = None
 
     async def _clip(self, text: str) -> bytes:
@@ -57,16 +62,15 @@ class SoundBank:
         return pcm
 
     async def load(self) -> None:
-        for kind, texts, volume in (("back", BACKCHANNEL, 0.7), ("filler", FILLERS, 1.0), ("call", CALLS, 1.0),
-                                     ("again", AGAIN, 1.0)):
+        for kind, texts, volume in (("filler", FILLERS, 0.85), ("call", CALLS, 0.85), ("think", THINK, 0.85),
+                                     ("again", AGAIN, 0.85), ("muted", MUTED, 0.85), ("reading", READING, 0.85)):
             for t in texts:
                 try:
                     if pcm := await self._clip(t):
                         self.clips[kind].append(_scale(pcm, volume))
                 except Exception as e:
                     log.warning("не смогла подготовить звук %r: %s", t, e)
-        log.info("звуки готовы: угу ×%d, хм ×%d, м? ×%d", len(self.clips["back"]), len(self.clips["filler"]),
-                 len(self.clips["call"]))
+        log.info("звуки готовы: %s", ", ".join(f"{k} ×{len(v)}" for k, v in self.clips.items()))
 
     def random(self, kind: str) -> bytes | None:
         """Случайный звук, но не тот же, что прозвучал только что («угу… угу» подряд режет слух)."""

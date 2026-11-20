@@ -13,6 +13,10 @@ log = logging.getLogger(__name__)
 _CJK = re.compile(r"[　-鿿가-힯＀-￯]+")
 # конец предложения: знак препинания (+ закрывающая кавычка/скобка) и пробел
 _SENT_END = re.compile(r"[.!?…]+[\"»)]?\s+")
+# конец первой части фразы — запятая, двоеточие, точка с запятой, тире: озвучку начинаем отсюда,
+# не дожидаясь конца всего предложения (первый звук раньше на 0.3–0.8 с)
+_CLAUSE_END = re.compile(r"(?:[,;:]|\s[—–])\s")
+CLAUSE_MIN_WORDS = 3  # «Вася,» — рано (обращение), «Не знаю, Вася,» — уже можно
 
 
 # эмодзи и прочие пиктограммы: голос их не прочтёт (вместо них персонаж пишет ремарки в скобках)
@@ -87,6 +91,25 @@ _LOST = re.compile(r"не\s+(?:совсем\s+|очень\s+)?(?:понимаю|
 
 def _content(norm: str) -> list[str]:
     return [w for w in norm.split() if w not in _STOP and w not in _FRAME]
+
+
+_SIMPLE = re.compile(r"^(?:\W*(?:привет\w*|здаров\w*|здравствуй\w*|хай|йоу|алло|ало|ау|эй|"
+                     r"ты\s+(?:тут|здесь|живой|жив|слышишь|с\s+нами)|как\s+(?:дела|ты|сам|жизнь|настроение)|"
+                     r"(?:что|чё|че)\s+делаешь|слышишь|спокойной\s+ночи|пока|доброе\s+утро|добрый\s+вечер)\W*)+$",
+                     re.IGNORECASE)
+
+
+def is_simple_address(heard: list[str]) -> bool:
+    """Простое обращение: зовут по имени, здороваются, «ты тут?», «как дела?» — без подвоха, мотив не нужен."""
+    from bot.brain.triggers import NAME_LIKE
+
+    if not heard:
+        return False
+    for text in heard:
+        words = [w for w in re.findall(r"[\w-]+", text.lower()) if not NAME_LIKE.match(w)]
+        if words and not _SIMPLE.match(" ".join(words)):
+            return False
+    return True
 
 
 def find_repeat(sentence: str, recent: list[str], threshold: int = 80) -> str | None:
@@ -193,14 +216,10 @@ class Responder:
                 "Ответь ему, учитывая контекст разговора.")
 
     @staticmethod
-    def _task_batch(new_lines: str) -> str:
-        return (
-            f"С твоего последнего ответа в чате сказали:\n{new_lines}\n\n"
-            f"{persona.DIRECT_TASK} "
-            "Реплики, обращённые не к тебе, — просто контекст. "
-            "Если твою прошлую реплику перебили — не повторяй её.\n"
-            f"{persona.MOTIVE_RULE}"
-        )
+    def _task_batch(new_lines: str, motive: bool = True) -> str:
+        # сами правила ответа — в системном промпте (persona.ANSWER_RULES): здесь только то, что меняется
+        return (f"С твоего последнего ответа в чате сказали:\n{new_lines}\n\n"
+                f"Ответь на обращение{'' if motive else ' (без мотива)'}.")
 
     @staticmethod
     def _task_proactive(topic: str, angle: str) -> str:
@@ -221,9 +240,11 @@ class Responder:
                      allow_repeat: bool = False) -> AsyncIterator[str]:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         heard = [line.split(": ", 1)[1] for line in new_lines.splitlines() if ": " in line]
-        task = self._task_batch(new_lines) + (f"\n{note}" if note else "")
-        # +30 токенов на строку мотива (~0.5 с на локальной модели до первого звука)
-        return self._guarded_stream(transcript, task, max_tokens=110, heard=heard, motive=True,
+        # на простое («привет», «ты тут?», «как дела?») мотив не читаем — там и так всё ясно, а это
+        # ~20 токенов (~0.3–0.8 с) до первого звука
+        motive = not is_simple_address(heard)
+        task = self._task_batch(new_lines, motive) + (f"\n{note}" if note else "")
+        return self._guarded_stream(transcript, task, max_tokens=110, heard=heard, motive=motive,
                                     allow_repeat=allow_repeat)
 
     async def reply_task(self, transcript: str, task: str, max_tokens: int = 100) -> str:
@@ -345,6 +366,7 @@ class Responder:
         )
         buf = ""
         usage_logged = False
+        said_any = False  # первая часть ответа ещё не ушла в озвучку
         try:
             async for event in stream:
                 if getattr(event, "usage", None) and not usage_logged:
@@ -362,7 +384,16 @@ class Responder:
                 while (m := _SENT_END.search(buf)) is not None:
                     sentence, buf = _clean(buf[: m.end()]), buf[m.end():]
                     if sentence:
+                        said_any = True
                         yield sentence
+                if not said_any and (m := _CLAUSE_END.search(buf)) is not None:
+                    head = buf[: m.end()]
+                    # не режем внутри скобок-ремарки и не отдаём одно обращение («Вася,»)
+                    if head.count("(") <= head.count(")") and len(head.split()) >= CLAUSE_MIN_WORDS:
+                        clause, buf = _clean(head), buf[m.end():]
+                        if clause:
+                            said_any = True
+                            yield clause
             if motive:  # поток кончился, а мотив так и не закрылся
                 buf, _ = self._take_motive(buf + "\n")
             if tail := _clean(buf):

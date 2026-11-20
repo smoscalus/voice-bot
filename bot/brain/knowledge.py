@@ -27,7 +27,7 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 SHOW_RECENT = 8          # свежие факты — всегда в ответе
-SHOW_RELEVANT = 12       # и столько подходящих к разговору
+SHOW_RELEVANT = 6        # и столько подходящих к разговору (они в подвижном хвосте промпта: ~30 токенов на факт)
 RECALL_MIN_SCORE = 0.45  # насколько факт должен подходить, чтобы считалось «вспомнил»
 RECALL_COOLDOWN_S = 1800
 
