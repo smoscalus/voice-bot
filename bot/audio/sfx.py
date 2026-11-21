@@ -25,6 +25,11 @@ READING = ["Щас, гляну в книжке…"]  # «почитай в кн�
 OVERLOAD = ["Стоп-стоп, вы все сразу! Давайте по одному, я теряюсь.",
             "Тихо-тихо, я не успеваю! По очереди, а?",
             "Ой, все сразу… Я запутался. По одному, пожалуйста."]
+# усталость (bot/brain/fatigue.py): вместо «погоди…», когда подустал; сам берёт перерыв и возвращается
+TIRED = ["Щас… голова тугая…", "Соображаю, погоди…", "Эх… щас, туплю немного…"]
+BREAK = ["Ох, всё, я выдохся. Дайте мне пару минут передохнуть.",
+         "Так, у меня голова кипит. Я пару минут помолчу, отдохну."]
+BACK = ["Так, отдохнул. Я снова тут.", "Всё, полегчало. Я с вами."]
 CACHE_DIR = Path("models/sfx")
 
 
@@ -48,7 +53,8 @@ class SoundBank:
         self.tts = tts
         self.dir = CACHE_DIR / voice_key.replace("/", "_")
         self.clips: dict[str, list[bytes]] = {"filler": [], "call": [], "think": [], "again": [], "muted": [],
-                                              "reading": [], "overload": []}
+                                              "reading": [], "overload": [],
+                                              "tired": [], "break": [], "back": []}
         self._last: bytes | None = None
 
     async def _clip(self, text: str) -> bytes:
@@ -68,7 +74,8 @@ class SoundBank:
     async def load(self) -> None:
         for kind, texts, volume in (("filler", FILLERS, 0.85), ("call", CALLS, 0.85), ("think", THINK, 0.85),
                                      ("again", AGAIN, 0.85), ("muted", MUTED, 0.85), ("reading", READING, 0.85),
-                                     ("overload", OVERLOAD, 1.0)):
+                                     ("overload", OVERLOAD, 1.0), ("tired", TIRED, 0.85),
+                                     ("break", BREAK, 1.0), ("back", BACK, 1.0)):
             for t in texts:
                 try:
                     if pcm := await self._clip(t):

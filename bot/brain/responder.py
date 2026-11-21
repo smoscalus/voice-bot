@@ -239,14 +239,14 @@ class Responder:
 
     # ---------------------------------------------------------------- потоково, по предложениям
     def stream_batch(self, transcript: str, new_lines: str, note: str = "",
-                     allow_repeat: bool = False) -> AsyncIterator[str]:
+                     allow_repeat: bool = False, max_tokens: int = 110) -> AsyncIterator[str]:
         # на обращения — мало токенов: обычно ответ в пару слов, при интересе — пара фраз
         heard = [line.split(": ", 1)[1] for line in new_lines.splitlines() if ": " in line]
         # на простое («привет», «ты тут?», «как дела?») мотив не читаем — там и так всё ясно, а это
         # ~20 токенов (~0.3–0.8 с) до первого звука
         motive = not is_simple_address(heard)
         task = self._task_batch(new_lines, motive) + (f"\n{note}" if note else "")
-        return self._guarded_stream(transcript, task, max_tokens=110, heard=heard, motive=motive,
+        return self._guarded_stream(transcript, task, max_tokens=max_tokens, heard=heard, motive=motive,
                                     allow_repeat=allow_repeat)
 
     async def reply_task(self, transcript: str, task: str, max_tokens: int = 100) -> str:

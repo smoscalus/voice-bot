@@ -30,6 +30,7 @@ from bot.audio.segmenter import Utterance, UtteranceSegmenter
 from bot.brain.interest import InterestClassifier
 from bot.brain.drive import get_drive
 from bot.brain.emotions import get_emotions
+from bot.brain.fatigue import get_fatigue
 from bot.brain.knowledge import get_knowledge
 from bot.brain.life import bury, dream, get_life, write_epitaph
 from bot.brain import book
@@ -227,6 +228,8 @@ class VoiceSession:
         self._overload_until = 0.0     # до этого момента галдёж пропускает мимо ушей
         self._overload_started = 0.0
         self._last_overload_said = 0.0
+        self.fatigue = get_fatigue() if settings.fatigue else None  # устаёт от настоящей нагрузки
+        self._on_break = False  # сам взял перерыв — молчит пару минут
         self._last_filler = 0.0  # когда звучал последний рефлекс «м?/угу»
         self._merged = 0  # сколько новых обращений влилось в ответ, который ещё думается
         self._rethink = asyncio.Event()  # бросил начатый ответ — озвучка может сказать «ага, так…»
@@ -349,7 +352,7 @@ class VoiceSession:
         chat = "Сейчас люди разговаривают между собой, не с тобой." if self._people_chatting() else ""
         blocks = [get_knowledge().recall_block(query), get_life().prompt_block(), self.drive.prompt_block(),
                   get_emotions().prompt_block(), get_predictor().prompt_block(), get_monologue().prompt_block(),
-                  chat, self._my_lines_block()]
+                  self.fatigue.prompt_block() if self.fatigue else "", chat, self._my_lines_block()]
         return "\n\n".join(b for b in blocks if b)
 
     def _my_lines_block(self) -> str:
@@ -389,6 +392,7 @@ class VoiceSession:
             self.segmenter.flush_stale()
             self._maybe_own_initiative()
             self._maybe_life_events()
+            self._maybe_break()
             # страховка: приём звука выключился (кто-то вызвал vc.stop() и т.п.) — включаем обратно
             if not self._reconnecting and self.vc.is_connected() and not self.vc.is_listening():
                 log.warning("приём звука был выключен — включаю обратно")
@@ -408,6 +412,38 @@ class VoiceSession:
                         min_voiced_ms=need_ms, started_after=self.player.started_at):
                     log.info("barge-in: меня перебили — замолкаю")
                     self.player.interrupt()
+
+    def _worn_out(self) -> bool:
+        return bool(self.fatigue) and self.fatigue.current() in ("worn", "spent")
+
+    def _maybe_break(self) -> None:
+        """Усталость: выдохся — сам просит пару минут и молчит; перерыв кончился — возвращается."""
+        if not self.fatigue:
+            return
+        if self._on_break:
+            if not self.fatigue.resting():
+                self._end_break(early=False)
+            return
+        if (self.muted_since or self.player.is_playing or self._reply_busy() or self._speak_lock.locked()
+                or not self.fatigue.wants_break()):
+            return
+        self._on_break = True
+        self.fatigue.start_break()
+        for t in (self._reply_task, self._eval_task):
+            if t and not t.done():
+                t.cancel()
+        self._waiting_speak = None
+        self._collecting = False
+        if self.sfx and (clip := self.sfx.random("break")):
+            self._spawn(self._play_clip(clip))
+
+    def _end_break(self, early: bool) -> None:
+        self._on_break = False
+        self.fatigue.end_break()
+        log.info("😮‍💨 перерыв кончился%s", " — позвали раньше" if early else "")
+        self._last_bot_seq = self.buffer.last_seq  # что сказали, пока отдыхал, — не отвечаем задним числом
+        if self.sfx and (clip := self.sfx.random("back")):
+            self._spawn(self._say_clip(clip))
 
     def _receiver_dead(self) -> bool:
         """Поток приёма звука voice-recv упал (любая ошибка внутри убивает его насовсем)."""
@@ -515,7 +551,10 @@ class VoiceSession:
             if cmd == "unmute" and self.muted_since:
                 self._spawn(self._unmute(utt.user_name))
                 return
-        if self.muted_since:
+            if cmd == "unmute" and self._on_break:
+                self._end_break(early=True)
+                return
+        if self.muted_since or self._on_break:
             return  # молчит: слышит и запоминает (летописец работает), но не отвечает и не встревает
 
         # 1) прямое обращение («Петрык, …»). Если о нём говорят в третьем лице («Петрык думает») —
@@ -563,7 +602,7 @@ class VoiceSession:
         if now < self._next_own_check:
             return
         self._next_own_check = now + OWN_CHECK_EVERY_S
-        if self.muted_since or get_monologue().active:
+        if self.muted_since or self._on_break or get_monologue().active or self._worn_out():
             return
         last_human = max((l.end_ts or l.ts for l in self.buffer.recent(10) if not l.is_bot), default=0.0)
         if (not self.proactive_enabled or self._reconnecting or self.player.is_playing or self._reply_busy()
@@ -913,10 +952,12 @@ class VoiceSession:
     # ------------------------------------------------------------------ batched reply
     def _request_reply(self, utt_end: float, user_id: int | None = None) -> None:
         """Попросить ответ. Если ответ уже собирается — новая реплика просто попадёт в ту же пачку."""
-        if self.muted_since:
+        if self.muted_since or self._on_break:
             return
         if user_id is not None and self._overloaded(user_id):
             return
+        if self.fatigue and user_id is not None:
+            self.fatigue.on_call()
         self._last_request_end = max(self._last_request_end, utt_end)
         if self._reply_task and not self._reply_task.done() and self._collecting:
             self._merged += 1  # ответ ещё не начал звучать — он передумает с учётом этой фразы
@@ -965,6 +1006,8 @@ class VoiceSession:
         self._waiting_speak = None
         self._collecting = False
         get_emotions().apply({"fear": 0.1})
+        if self.fatigue:
+            self.fatigue.on_overload()
         say = now - self._last_overload_said > OVERLOAD_SAY_GAP_S and self.sfx and self.sfx.random("overload")
         log.info("перегрузка: %d обращений за %.0f с от %d человек — %s", len(window), self.s.overload_window_s,
                  len({u for _, u in window}), "прошу по одному" if say else "молча жду, пока станет тише")
@@ -1029,7 +1072,8 @@ class VoiceSession:
         def make():
             ls = fresh_lines() or lines
             return self.responder.stream_batch(self.buffer.render(self.buffer.recent(12)), self.buffer.render(ls),
-                                               note=note, allow_repeat=bool(repeat_note))
+                                               note=note, allow_repeat=bool(repeat_note),
+                                               max_tokens=self.fatigue.max_tokens(110) if self.fatigue else 110)
 
         await self._speak_stream(self._speculative(make), proactive=False, utt_end=utt_end,
                                  filler=filler_kind(lines))
@@ -1065,8 +1109,8 @@ class VoiceSession:
 
     # ------------------------------------------------------------------ decision
     def _schedule_evaluation(self) -> None:
-        if self.muted_since:
-            return
+        if self.muted_since or self._on_break or self._worn_out():
+            return  # молчит, отдыхает или вымотан — сам в разговор не лезет
         # Одна отложенная оценка за раз: она сама подхватит все новые реплики,
         # т.к. берёт буфер в момент запуска.
         if self._eval_task and not self._eval_task.done():
@@ -1175,7 +1219,7 @@ class VoiceSession:
             first = False
             yield chunk
 
-    async def _sentences_to_audio(self, sentences, said: list[str]):
+    async def _sentences_to_audio(self, sentences, said: list[str], on_first=None):
         """Текст по предложениям → звук. Следующие предложения озвучиваются заранее, пока играет текущее."""
         order: asyncio.Queue[asyncio.Queue | None] = asyncio.Queue()
         workers: list[asyncio.Task] = []
@@ -1192,6 +1236,8 @@ class VoiceSession:
         async def producer() -> None:
             try:
                 async for s in sentences:
+                    if not said and on_first:
+                        on_first()
                     said.append(s)
                     q: asyncio.Queue = asyncio.Queue()
                     workers.append(asyncio.create_task(tts_into(s, q)))
@@ -1234,7 +1280,9 @@ class VoiceSession:
             now = time.monotonic()
             instant = bool(kind) and self.s.provider == "local" and now - self._last_filler >= FILLER_GAP_S
             done, _ = await asyncio.wait({first}, timeout=0.05 if instant else 0.9)
-            if not done and self.sfx and (clip := self.sfx.random(kind if instant else "filler")):
+            tired = self.fatigue and self.fatigue.current() != "fresh"
+            pool = "tired" if tired and (instant or kind) else (kind if instant else "filler")
+            if not done and self.sfx and (clip := self.sfx.random(pool) or self.sfx.random(kind or "filler")):
                 self._last_filler = now
                 for i in range(0, len(clip), 4800):
                     yield clip[i : i + 4800]
@@ -1270,7 +1318,7 @@ class VoiceSession:
 
     async def _speak_stream(self, sentences, *, proactive: bool, utt_end: float | None = None,
                             expect: str = "", filler: str | None = None) -> None:
-        if self.muted_since and not self._unmuting:
+        if (self.muted_since or self._on_break) and not self._unmuting:
             return  # попросили помолчать — ни слова (кроме реакции на «можешь говорить»)
         # Свою же реплику не обрываем новым ответом: он подождёт очереди (_speak_lock).
         # Перебить бота можно голосом (barge-in) или стоп-словом.
@@ -1311,9 +1359,15 @@ class VoiceSession:
             self._speaking_proactive = proactive
             said: list[str] = []
             try:
+                on_first = None
+                if self.fatigue and utt_end and not proactive:
+                    turn = time.time()  # ожидание в очереди за своей же репликой — не «долго соображал»
+
+                    def on_first():  # от конца фразы (или своей очереди) до первых слов, без рефлекса «погоди…»
+                        self.fatigue.on_reply_latency(time.time() - max(utt_end, self._last_request_end, turn))
                 await self.player.play_stream(
-                    self._first_chunk_logged(self._with_filler(self._sentences_to_audio(sentences, said), filler),
-                                             utt_end))
+                    self._first_chunk_logged(
+                        self._with_filler(self._sentences_to_audio(sentences, said, on_first), filler), utt_end))
             except Exception:
                 log.exception("TTS/playback failed")
             finally:
@@ -1343,6 +1397,8 @@ class VoiceSession:
                 self._speaking_proactive = False
                 if self._speaking_task is me:
                     self._speaking_task = None
+                if self.fatigue and text:
+                    self.fatigue.on_spoke()
                 self.policy.note_spoke(proactive)
                 if proactive and text:
                     self.drive.on_spoke()

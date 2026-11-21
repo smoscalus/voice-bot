@@ -95,6 +95,7 @@ class Settings:
     stale_reply_s: float      # ответ, дождавшийся очереди позже этого после фразы, выбрасывается (тема ушла)
     overload_calls: int       # столько обращений за overload_window_s от 2+ людей — «стоп, по одному!»
     overload_window_s: float
+    fatigue: bool             # устаёт от настоящей нагрузки (медленные ответы, дёргают без передышки)
 
 
 def _brain(provider: str) -> dict:
@@ -194,4 +195,5 @@ def load_settings(provider: str | None = None) -> Settings:
         stale_reply_s=_f("STALE_REPLY_S", 20),
         overload_calls=_i("OVERLOAD_CALLS", 4),
         overload_window_s=_f("OVERLOAD_WINDOW_S", 10),
+        fatigue=_s("FATIGUE", "on").lower() in ("on", "1", "true"),
     )
