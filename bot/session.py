@@ -138,6 +138,9 @@ class _Prefetch:
 
 FILLER_GAP_S = 6.0          # два «угу» подряд чаще — уже не рефлекс, а тик
 SPECULATIVE_RESTARTS = 2    # сколько раз можно передумать, если человек договорил ещё что-то
+OVERLOAD_CALM_S = 4.0       # перегрузка кончается, когда к нему столько секунд не обращались
+OVERLOAD_MAX_S = 20.0       # дольше галдёж мимо ушей не пропускает — снова отвечает (по одному ответу в очереди)
+OVERLOAD_SAY_GAP_S = 60.0   # «стоп, по одному!» — не чаще раза в минуту, дальше молча ждёт тишины
 
 
 def filler_kind(lines) -> str:
@@ -210,8 +213,20 @@ class VoiceSession:
         self._last_reconnect = time.monotonic()
         self._stt_inflight = 0
         self._collecting = False
-        self._gen_owner: asyncio.Task | None = None  # чей ответ сейчас думается
-        self._gen_done = asyncio.Event()
+        self._gen_done_of: dict[asyncio.Task, asyncio.Event] = {}  # ответ → «додумал» (думать новый можно,
+        #                                                             пока звучит старый)
+        # очередь ответов — максимум один ждущий: он думается, пока звучит прошлый, и ждёт очереди сказать.
+        # Новое обращение не встаёт вторым в очередь, а заменяет ждущий (тот передумывается с новой фразой).
+        self._waiting_speak: asyncio.Task | None = None  # ответ, который додуман и ждёт, пока договорит прошлый
+        self._speaking_task: asyncio.Task | None = None  # чья реплика звучит сейчас
+        self._reply_seq0: dict[asyncio.Task, int] = {}   # ответ → с какой реплики он отвечает
+        self._reply_prev: dict[asyncio.Task, asyncio.Task | None] = {}  # ответ → за кем он в очереди
+        self._last_request_end = 0.0  # конец последней фразы, на которую просили ответ (для «протухания»)
+        # перегрузка: все налетели разом — «стоп, по одному!»
+        self._calls: deque[tuple[float, int]] = deque(maxlen=20)  # (когда, кто) обращения к нему
+        self._overload_until = 0.0     # до этого момента галдёж пропускает мимо ушей
+        self._overload_started = 0.0
+        self._last_overload_said = 0.0
         self._last_filler = 0.0  # когда звучал последний рефлекс «м?/угу»
         self._merged = 0  # сколько новых обращений влилось в ответ, который ещё думается
         self._rethink = asyncio.Event()  # бросил начатый ответ — озвучка может сказать «ага, так…»
@@ -491,8 +506,11 @@ class VoiceSession:
 
         # 0) «Петрык, помолчи» / «Петрык, можешь говорить»
         if trig.wake and (cmd := voice_command(trig.remainder, persona.MUTE_PHRASES, persona.UNMUTE_PHRASES)):
-            if cmd == "mute" and not self.muted_since:
-                self._mute(utt.user_name)
+            if cmd == "mute":
+                if not self.muted_since:
+                    self._mute(utt.user_name)
+                elif self.player.is_playing:
+                    self.player.interrupt()  # уже молчит, но что-то всё же звучит — обрываем
                 return
             if cmd == "unmute" and self.muted_since:
                 self._spawn(self._unmute(utt.user_name))
@@ -518,15 +536,15 @@ class VoiceSession:
             if book.per_day() > 0 and book.READ_REQUEST.search(text):
                 self._spawn(self._read_book_asked(text, utt_end))  # «Петрык, почитай в книжке про Крым»
                 return
-            self._request_reply(utt_end)
+            self._request_reply(utt_end, utt.user_id)
             return
         if self.policy.take_attention(utt.user_id):
-            self._request_reply(utt_end)
+            self._request_reply(utt_end, utt.user_id)
             return
         # 1б) продолжение разговора с ним без имени: он только что спросил — ему отвечают, или говорят «ты…»
         #     Раньше это шло через «внутренний голос» (лишний заход к модели, +10–15 с на локальной) — теперь сразу.
         if self._continues_with_me(text):
-            self._request_reply(utt_end)
+            self._request_reply(utt_end, utt.user_id)
             return
 
         # 2) контекстная инициатива
@@ -537,7 +555,7 @@ class VoiceSession:
     async def _answer_if_no_followup(self, user_id: int, utt_end: float) -> None:
         await asyncio.sleep(min(2.5, self.s.attention_window_s))
         if self.policy.take_attention(user_id):  # продолжения не было
-            self._request_reply(utt_end)
+            self._request_reply(utt_end, user_id)
 
     def _maybe_own_initiative(self) -> None:
         """Свои дела: в затишье бот иногда сам начинает тему — редко и только когда очень хочет."""
@@ -657,6 +675,12 @@ class VoiceSession:
         """«Петрык, помолчи»: замолкает сразу (даже посреди фразы), тихо говорит «понял, молчу» и молчит."""
         self.muted_since = time.monotonic()
         log.info("%s попросил помолчать — молчу", who)
+        # всё, что надумано и ждёт очереди сказать, — в мусор (раньше это договаривалось после «помолчи»)
+        for t in (self._reply_task, self._eval_task):
+            if t and not t.done() and t is not self._speaking_task:
+                t.cancel()
+        self._waiting_speak = None
+        self._collecting = False
         if self.player.is_playing:
             self.player.interrupt()
         elif self.sfx and (clip := self.sfx.random("muted")):
@@ -887,10 +911,13 @@ class VoiceSession:
                 proactive=False))
 
     # ------------------------------------------------------------------ batched reply
-    def _request_reply(self, utt_end: float) -> None:
+    def _request_reply(self, utt_end: float, user_id: int | None = None) -> None:
         """Попросить ответ. Если ответ уже собирается — новая реплика просто попадёт в ту же пачку."""
         if self.muted_since:
             return
+        if user_id is not None and self._overloaded(user_id):
+            return
+        self._last_request_end = max(self._last_request_end, utt_end)
         if self._reply_task and not self._reply_task.done() and self._collecting:
             self._merged += 1  # ответ ещё не начал звучать — он передумает с учётом этой фразы
             return
@@ -898,28 +925,82 @@ class VoiceSession:
             # к нему обратились, пока он прикидывал «а не влезть ли», — бросаем это, видеокарта нужна ответу
             self._eval_task.cancel()
             log.info("бросил раздумья «встревать ли» — к нему обратились")
-        # если бот сейчас отвечает — следующий ответ встанет в очередь за ним
         prev = self._reply_task if self._reply_task and not self._reply_task.done() else None
-        self._reply_task = self._spawn(self._reply_batch(utt_end, prev))
+        if prev is not None and prev is self._waiting_speak:
+            # ответ уже додуман и ждёт, пока договорит прошлый, — вторым в очередь не встаём: бросаем его и
+            # думаем заново с новой фразой (иначе очередь растёт и он отвечает на то, что было минуты назад)
+            self._waiting_speak = None
+            seq0 = self._reply_seq0.get(prev)
+            if seq0 is not None:
+                self._last_bot_seq = min(self._last_bot_seq, seq0)  # те фразы ещё не отвечены
+            before = self._reply_prev.get(prev)
+            prev.cancel()
+            log.info("ответ ждал очереди — передумываю его с учётом новой фразы")
+            prev = before if before is not None and not before.done() else None
+        # если бот сейчас отвечает — следующий ответ встанет в очередь за ним (и будет единственным)
+        task = self._spawn(self._reply_batch(utt_end, prev))
+        self._reply_prev[task] = prev
+        self._reply_task = task
+
+    def _overloaded(self, user_id: int) -> bool:
+        """Налетели все разом (много обращений от разных людей за пару секунд): один раз говорит «стоп, по
+        одному!» и пропускает галдёж мимо ушей, пока не станет потише. → True — этот запрос не отвечаем."""
+        now = time.monotonic()
+        if now < self._overload_until and now - self._overload_started < OVERLOAD_MAX_S:
+            self._overload_until = now + OVERLOAD_CALM_S  # галдят дальше — ждём ещё
+            self._last_bot_seq = self.buffer.last_seq     # это он «не разобрал» — отвечать потом не будет
+            return True
+        self._calls.append((now, user_id))
+        window = [(t, u) for t, u in self._calls if now - t <= self.s.overload_window_s]
+        if len(window) < self.s.overload_calls or len({u for _, u in window}) < 2:
+            return False
+        self._calls.clear()
+        self._overload_started = now
+        self._overload_until = now + OVERLOAD_CALM_S
+        self._last_bot_seq = self.buffer.last_seq
+        # всё, что успело надуматься на этот галдёж, — бросаем (то, что уже звучит, договорит или прервут голосом)
+        for t in (self._reply_task, self._eval_task):
+            if t and not t.done() and t is not self._speaking_task:
+                t.cancel()
+        self._waiting_speak = None
+        self._collecting = False
+        get_emotions().apply({"fear": 0.1})
+        say = now - self._last_overload_said > OVERLOAD_SAY_GAP_S and self.sfx and self.sfx.random("overload")
+        log.info("перегрузка: %d обращений за %.0f с от %d человек — %s", len(window), self.s.overload_window_s,
+                 len({u for _, u in window}), "прошу по одному" if say else "молча жду, пока станет тише")
+        if say:
+            self._last_overload_said = now
+            self._spawn(self._say_clip(say))
+        return True
+
+    async def _say_clip(self, clip: bytes) -> None:
+        """Готовый звук в очередь реплик (после того, что звучит сейчас), без мыслей модели."""
+        async with self._speak_lock:
+            if not self.muted_since:
+                await self._play_clip(clip)
 
     async def _reply_batch(self, utt_end: float, prev: asyncio.Task | None = None) -> None:
         try:
             with foreground():  # пока собираем пачку и отвечаем — фоновые дела ждут
                 await self._reply_batch_inner(utt_end, prev)
         finally:
-            if self._reply_task is asyncio.current_task():
+            me = asyncio.current_task()
+            if self._reply_task is me:
                 self._collecting = False  # вышли, так и не начав говорить (пусто, «ага» в мыслях, ошибка)
+            self._reply_seq0.pop(me, None)
+            self._reply_prev.pop(me, None)
 
     async def _reply_batch_inner(self, utt_end: float, prev: asyncio.Task | None = None) -> None:
         self._collecting = True  # пока ждём — новые обращения вливаются в эту же пачку
         if prev is not None:
             # ждём не пока договорит, а пока ДОДУМАЕТ прошлый ответ: думать над новым можно, пока звучит старый
-            while not prev.done() and not (self._gen_owner is prev and self._gen_done.is_set()):
+            while not prev.done() and not ((ev := self._gen_done_of.get(prev)) and ev.is_set()):
                 await asyncio.sleep(0.05)
         # Пачку не ждём: начинаем думать сразу (рефлекс «м?» прикроет паузу). Если человек тут же
         # договорил ещё фразу — до первого слова ответа передумаем с учётом её (см. _speculative).
         # _collecting остаётся True, пока можно передумать: новые фразы вливаются сюда, а не в отдельный ответ.
         seq0 = self._last_bot_seq
+        self._reply_seq0[asyncio.current_task()] = seq0
         cutoff = time.time() - 30
 
         def fresh_lines():
@@ -1194,17 +1275,35 @@ class VoiceSession:
         # Свою же реплику не обрываем новым ответом: он подождёт очереди (_speak_lock).
         # Перебить бота можно голосом (barge-in) или стоп-словом.
         pf = _Prefetch(sentences)  # модель начинает думать сразу, даже если ещё звучит прошлая реплика
-        self._gen_owner, self._gen_done = asyncio.current_task(), pf.done
+        me = asyncio.current_task()
+        self._gen_done_of[me] = pf.done
         try:
             with foreground():
                 await self._speak_stream_inner(pf, proactive=proactive, utt_end=utt_end, expect=expect,
                                                filler=filler)
         finally:
+            self._gen_done_of.pop(me, None)
             await pf.aclose()
 
     async def _speak_stream_inner(self, sentences, *, proactive: bool, utt_end: float | None = None,
                                   expect: str = "", filler: str | None = None) -> None:
+        me = asyncio.current_task()
+        if not proactive and me is self._reply_task:
+            self._waiting_speak = me  # додуман и ждёт очереди — новое обращение его заменит
         async with self._speak_lock:
+            if self._waiting_speak is me:
+                self._waiting_speak = None
+            # пока ждал очереди, попросили помолчать — ни слова
+            if self.muted_since and not self._unmuting:
+                log.info("ответ из очереди выброшен: попросили помолчать")
+                return
+            # ответ протух: последняя фраза, на которую он отвечает, была давно — люди уже о другом
+            if utt_end and not proactive:
+                age = time.time() - max(utt_end, self._last_request_end)
+                if age > self.s.stale_reply_s:
+                    log.info("ответ из очереди выброшен: устарел (%.0f с после фразы)", age)
+                    return
+            self._speaking_task = me
             line = self.buffer.add(persona.BOT_NAME, "…", is_bot=True)
             if isinstance(sentences, _Prefetch):
                 sentences.attach(line)  # как только текст додуман — он виден следующему ответу
@@ -1242,6 +1341,8 @@ class VoiceSession:
                 log.info("BOT (%s%s): %s", "proactive" if proactive else "direct",
                          ", перебили" if cut else "", line.text)
                 self._speaking_proactive = False
+                if self._speaking_task is me:
+                    self._speaking_task = None
                 self.policy.note_spoke(proactive)
                 if proactive and text:
                     self.drive.on_spoke()

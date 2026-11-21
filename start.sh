@@ -167,6 +167,15 @@ run_setup() {  # $1 = 1 при первом запуске
   speed=$(ask "Темп речи: 1 — обычный, 2 — чуть быстрее" "$def")
   set_env PIPER_SPEED "$([ "$speed" = 2 ] && echo 1.15 || echo 1.0)"
 
+  # перебивание голосом
+  say ""
+  def=y; [ "$(get_env BARGE_IN_MS)" = 0 ] && [ "$first" != 1 ] && def=n
+  if yes_no "Можно перебивать его голосом? (говоришь поверх ~1 с — он замолкает; в шумной компании иногда будет обрываться)" "$def"; then
+    set_env BARGE_IN_MS 900
+  else
+    set_env BARGE_IN_MS 0
+  fi
+
   # как запускать
   say ""; say "Как запускать?"
   say "  1 — напрямую (Python на этом компе) — проще всего на Linux"

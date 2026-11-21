@@ -21,6 +21,10 @@ CALLS = ["Секунду…", "Щас…"]    # позвали только по
 AGAIN = ["Так, погоди…", "Услышал, щас…", "Погоди-погоди…"]  # человек договорил ещё — думает заново
 MUTED = ["Понял, молчу."]       # «Петрык, помолчи»
 READING = ["Щас, гляну в книжке…"]  # «почитай в книжке»
+# на него налетели все разом — теряется и просит по одному
+OVERLOAD = ["Стоп-стоп, вы все сразу! Давайте по одному, я теряюсь.",
+            "Тихо-тихо, я не успеваю! По очереди, а?",
+            "Ой, все сразу… Я запутался. По одному, пожалуйста."]
 CACHE_DIR = Path("models/sfx")
 
 
@@ -44,7 +48,7 @@ class SoundBank:
         self.tts = tts
         self.dir = CACHE_DIR / voice_key.replace("/", "_")
         self.clips: dict[str, list[bytes]] = {"filler": [], "call": [], "think": [], "again": [], "muted": [],
-                                              "reading": []}
+                                              "reading": [], "overload": []}
         self._last: bytes | None = None
 
     async def _clip(self, text: str) -> bytes:
@@ -63,7 +67,8 @@ class SoundBank:
 
     async def load(self) -> None:
         for kind, texts, volume in (("filler", FILLERS, 0.85), ("call", CALLS, 0.85), ("think", THINK, 0.85),
-                                     ("again", AGAIN, 0.85), ("muted", MUTED, 0.85), ("reading", READING, 0.85)):
+                                     ("again", AGAIN, 0.85), ("muted", MUTED, 0.85), ("reading", READING, 0.85),
+                                     ("overload", OVERLOAD, 1.0)):
             for t in texts:
                 try:
                     if pcm := await self._clip(t):

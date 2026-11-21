@@ -92,6 +92,9 @@ class Settings:
     # размышления локальной модели: в живом ответе (быстро — выкл) и в фоновых делах (досье, сны — можно вкл)
     think_reply: bool | None
     think_background: bool | None
+    stale_reply_s: float      # ответ, дождавшийся очереди позже этого после фразы, выбрасывается (тема ушла)
+    overload_calls: int       # столько обращений за overload_window_s от 2+ людей — «стоп, по одному!»
+    overload_window_s: float
 
 
 def _brain(provider: str) -> dict:
@@ -188,4 +191,7 @@ def load_settings(provider: str | None = None) -> Settings:
         persona_prompt=_s("PERSONA_PROMPT", "auto").lower(),
         think_reply=_onoff("THINK_REPLY", "off"),
         think_background=_onoff("THINK_BACKGROUND", "on"),
+        stale_reply_s=_f("STALE_REPLY_S", 20),
+        overload_calls=_i("OVERLOAD_CALLS", 4),
+        overload_window_s=_f("OVERLOAD_WINDOW_S", 10),
     )

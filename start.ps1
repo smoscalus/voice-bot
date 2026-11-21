@@ -168,6 +168,11 @@ function Run-Setup([bool]$first) {
     $def = if ((Get-EnvValue "PIPER_SPEED") -eq "1.15") { "2" } else { "1" }
     Set-EnvValue "PIPER_SPEED" $(if ((Ask "Темп речи: 1 — обычный, 2 — чуть быстрее" $def) -eq "2") { "1.15" } else { "1.0" })
 
+    # перебивание голосом
+    $def = if (-not $first -and (Get-EnvValue "BARGE_IN_MS") -eq "0") { "n" } else { "y" }
+    $barge = Ask-YesNo "`nМожно перебивать его голосом? (говоришь поверх ~1 с — он замолкает; в шумной компании иногда будет обрываться)" $def
+    Set-EnvValue "BARGE_IN_MS" $(if ($barge) { "900" } else { "0" })
+
     # как запускать
     Say "`nКак запускать?"
     Say "  1 — напрямую (Python на этом компе)"
