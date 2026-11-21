@@ -173,8 +173,20 @@ function Run-Setup([bool]$first) {
     Say "  1 — напрямую (Python на этом компе)"
     Say "  2 — через Docker"
     $cur = Get-EnvValue "RUN_MODE"
-    $def = if ($cur -eq "docker") { "2" } elseif ($cur -eq "direct") { "1" } elseif (Test-Docker) { "2" } else { "1" }
-    Set-EnvValue "RUN_MODE" $(if ((Ask "Выбери 1 или 2" $def) -eq "2") { "docker" } else { "direct" })
+    # Docker на Windows отдаёт контейнеру только видеокарту NVIDIA: с AMD/Intel модель в Docker считала бы
+    # на процессоре — советуем «напрямую» (Ollama на самом Windows видит и Radeon)
+    $noDockerGpu = $provider -eq "local" -and $gpu.Vendor -ne "nvidia"
+    if ($noDockerGpu) {
+        Say "  У тебя не NVIDIA: в Docker модель считала бы на процессоре (медленно). Советую 1 — напрямую." "Yellow"
+        $def = "1"
+    } else {
+        $def = if ($cur -eq "docker") { "2" } elseif ($cur -eq "direct") { "1" } elseif (Test-Docker) { "2" } else { "1" }
+    }
+    $mode = Ask "Выбери 1 или 2" $def
+    if ($mode -eq "2" -and $noDockerGpu) {
+        $mode = if (Ask-YesNo "Точно Docker? Модель будет на процессоре — если Ollama не запущена на самом компе" "n") { "2" } else { "1" }
+    }
+    Set-EnvValue "RUN_MODE" $(if ($mode -eq "2") { "docker" } else { "direct" })
 
     # для любопытных
     if ($provider -eq "local" -and (Ask-YesNo "Расширенные настройки (размышления модели)?" "n")) {
@@ -359,6 +371,17 @@ $provider = Get-EnvValue "PROVIDER"
 if (-not $provider) { $provider = "local" }
 $mode = Get-EnvValue "RUN_MODE"
 if (-not $mode) { $mode = "docker" }  # .env от старой версии: раньше был только Docker
+
+# Docker + мозги на компе + не NVIDIA + Ollama на самом компе не запущена → Ollama поднимется в контейнере
+# на процессоре (видеокарту AMD/Intel Docker на Windows не отдаёт). Предлагаем запуск напрямую.
+if ($mode -eq "docker" -and $provider -eq "local" -and -not (Test-HostOllama) -and (Get-Gpu).Vendor -ne "nvidia") {
+    Say "`nВнимание: в Docker модель будет считать на процессоре — видеокарту AMD/Intel Docker на Windows не видит." "Yellow"
+    Say "Напрямую (Ollama на самом Windows) она возьмёт видеокарту и будет в разы быстрее." "Yellow"
+    if (Ask-YesNo "Перейти на запуск напрямую?" "y") {
+        Set-EnvValue "RUN_MODE" "direct"
+        $mode = "direct"
+    }
+}
 
 if ($mode -eq "docker") {
     Run-Docker $provider

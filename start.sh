@@ -173,6 +173,11 @@ run_setup() {  # $1 = 1 при первом запуске
   say "  2 — через Docker"
   def=1; [ "$(get_env RUN_MODE)" = docker ] && def=2
   mode=$(ask "Выбери 1 или 2" "$def")
+  if [ "$mode" = 2 ] && [ "$provider" = local ] && [ "${vendor:-none}" != nvidia ]; then
+    # Ollama в контейнере видит только NVIDIA (AMD — нужен особый образ и настройка), иначе — процессор
+    warn "У тебя не NVIDIA: если Ollama поднимется в Docker, модель будет считать на процессоре (медленно)."
+    yes_no "Точно Docker? (напрямую Ollama возьмёт и Radeon)" n || mode=1
+  fi
   set_env RUN_MODE "$([ "$mode" = 2 ] && echo docker || echo direct)"
 
   # для любопытных
